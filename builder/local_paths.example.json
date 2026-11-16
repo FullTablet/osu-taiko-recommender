@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy this file to local_paths.json (ignored by git) and fill in your own paths. Add anything else that must never be published (user names, company names, ...) to private_strings.",
+  "paths": {
+    "dataset_dir": "<folder with checkpoint_last.pt, meta.json, player_roster.json, player.db>",
+    "checkpoint": "<dataset folder>/checkpoint_last.pt",
+    "congregal_db": "<path to congregals.sqlite>",
+    "plays_db": "<path to taiko_plays.sqlite>",
+    "dump_dir": "<data.ppy.sh dump folder with osu_beatmaps.sql and osu_beatmapsets.sql>",
+    "code_dir": "<folder that contains taiko_app, difficulty_nn and taiko_pipeline>"
+  },
+  "private_strings": [
+    "<your user name>",
+    "<anything else private>"
+  ]
+}

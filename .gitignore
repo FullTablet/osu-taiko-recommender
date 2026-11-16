@@ -1,0 +1,14 @@
+# build output and local data (the downloads users need go into GitHub releases, not the repo)
+dist/
+data/
+runtime/
+*.zip
+*.zip.[0-9][0-9][0-9]
+# python
+__pycache__/
+*.pyc
+# created by the installer
+osu!taiko recommender.bat
+
+# private local configuration (your paths): never published
+builder/local_paths.json
