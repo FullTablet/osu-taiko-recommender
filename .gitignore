@@ -1,5 +1,6 @@
-# build output and local data (the downloads users need go into GitHub releases, not the repo)
-dist/
+# build output and local data (the downloads users need go into GitHub releases, not the repo);
+# /dist*/ also covers renamed copies such as dist_old/
+/dist*/
 data/
 runtime/
 *.zip

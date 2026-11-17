@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
                                QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -13,10 +13,11 @@ from taiko_core import packages
 from taiko_core.app_state import COMP_FILE, chart_label
 from taiko_core.chartdb import ChartDB, IncompatibleDatabase
 from taiko_core.importer import import_files, recompute_all
-from taiko_core.mods import DEFAULT_IMPORT_MODS, DT, EZ, FL, HD, HR, HT, mods_label
+from taiko_core.mods import DEFAULT_IMPORT_MODS, mods_label
 from taiko_core.recommend import DIMENSION_NAMES, DIMENSIONS
 
-from .widgets import ChartPickerDialog, ModSelector, SkillPanel, pct
+from .widgets import (ChartPickerDialog, EditableCellDelegate, ModCheckRow, ModSelector, SkillPanel, copy_with_tip,
+                      link_button, open_url, pct)
 from .worker import run_task
 
 
@@ -51,7 +52,27 @@ def parse_percent(text: str):
 
 
 # =============================================================================== recommendations
+def beatmap_urls(info: dict) -> tuple[str, str] | None:
+    """(website URL, osu!direct URL) for a chart with a beatmap ID, else None."""
+    try:
+        bid = int(info.get("beatmap_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    if bid <= 0:
+        return None
+    return f"https://osu.ppy.sh/b/{bid}", f"osu://b/{bid}"
+
+
+def search_text(info: dict) -> str:
+    """What the chart button copies for osu!'s song-select search: 'Artist Title Difficulty'."""
+    return " ".join(str(info.get(k) or "").strip() for k in ("artist", "title", "version") if info.get(k))
+
+
 class RecommendTab(QWidget):
+    COLUMNS = ["URL", "osu!direct", "chart", "mapper", "mods", "expected accuracy"] + DIMENSIONS + ["your accuracy (%)"]
+    COL_URL, COL_DIRECT, COL_CHART, COL_MAPPER, COL_MODS, COL_EXPECTED = range(6)
+    COL_PRIORITY = 6
+    COL_ACC = 6 + len(DIMENSIONS)
     PRIORITY_ITEMS = [("none", None)] + [(f"{g}  {n}", i) for i, (g, n) in enumerate(zip(DIMENSIONS, DIMENSION_NAMES))]
 
     def __init__(self, main):
@@ -78,20 +99,18 @@ class RecommendTab(QWidget):
         self.target.setRange(0.01, 99.99)            # strictly between 0% and 100%
         self.target.setSuffix(" %")
         self.target.setSingleStep(0.5)
-        grid.addWidget(QLabel("charts to search (K)"), 0, 0)
+        grid.addWidget(QLabel("charts to search"), 0, 0)
         grid.addWidget(self.k_spin, 0, 1)
-        grid.addWidget(QLabel("charts to show (S)"), 0, 2)
+        grid.addWidget(QLabel("charts to show"), 0, 2)
         grid.addWidget(self.s_spin, 0, 3)
-        grid.addWidget(QLabel("skill priority"), 1, 0)
+        grid.addWidget(QLabel("prioritize this skill"), 1, 0)
         grid.addWidget(self.priority, 1, 1)
         grid.addWidget(QLabel("target accuracy"), 1, 2)
         grid.addWidget(self.target, 1, 3)
         mrow = QHBoxLayout()
-        self.mod_boxes = {}
-        for bit, name in ((EZ, "EZ"), (HD, "HD"), (HR, "HR"), (DT, "DT"), (HT, "HT"), (FL, "FL")):
-            cb = QCheckBox(name)
-            self.mod_boxes[bit] = cb
-            mrow.addWidget(cb)
+        self.mod_row = ModCheckRow(0)
+        self.mod_boxes = self.mod_row.boxes
+        mrow.addWidget(self.mod_row)
         self.mods_info = QLabel("")
         self.mods_info.setStyleSheet("color: gray")
         mrow.addSpacing(12)
@@ -114,11 +133,15 @@ class RecommendTab(QWidget):
         lay.addLayout(row)
         hint = QLabel("play the charts, then type the accuracy you got (leave empty if you skipped one); the last "
                       "row counts as your most recent play. α–ε: how much each skill matters for reaching the "
-                      "target accuracy on that chart.")
+                      "target accuracy on that chart. a grey expected accuracy is outside target ± 1 (shown only "
+                      "when not enough charts are inside). click a chart's name to copy it for osu!'s search.")
         hint.setStyleSheet("color: gray")
         hint.setWordWrap(True)
         lay.addWidget(hint)
-        self.table = _table(["chart", "mods", "expected accuracy"] + DIMENSIONS + ["your accuracy (%)"])
+        self.table = _table(self.COLUMNS, stretch_col=self.COL_CHART)
+        self.table.setItemDelegateForColumn(self.COL_ACC, EditableCellDelegate(self.table))
+        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)      # one click starts typing
+        self.table.verticalHeader().setDefaultSectionSize(30)
         lay.addWidget(self.table)
 
         self.load_settings()
@@ -128,32 +151,22 @@ class RecommendTab(QWidget):
             w.valueChanged.connect(lambda _v: self.save_settings())
         self.target.valueChanged.connect(lambda _v: self.save_settings())
         self.priority.currentIndexChanged.connect(lambda _i: self.save_settings())
-        for bit, cb in self.mod_boxes.items():
-            cb.toggled.connect(lambda checked, b=bit: self.mod_toggled(b, checked))
+        self.mod_row.changed.connect(self.save_settings)
 
     # ---- settings
     def selected_mods(self) -> int:
-        return sum(bit for bit, cb in self.mod_boxes.items() if cb.isChecked())
-
-    def mod_toggled(self, bit, checked):
-        if checked:
-            for a_, b_ in ((EZ, HR), (DT, HT)):                    # incompatible pairs
-                other = b_ if bit == a_ else a_ if bit == b_ else None
-                if other is not None and self.mod_boxes[other].isChecked():
-                    self.mod_boxes[other].setChecked(False)
-        self.save_settings()
+        return self.mod_row.value()
 
     def load_settings(self):
         st = self.state.recommendation_settings()
-        widgets = [self.k_spin, self.s_spin, self.target, self.priority] + list(self.mod_boxes.values())
+        widgets = [self.k_spin, self.s_spin, self.target, self.priority]
         for w in widgets:
             w.blockSignals(True)
         self.k_spin.setValue(st["K"])
         self.s_spin.setValue(st["S"])
         self.target.setValue(round(st["target"] * 100, 2))
         self.priority.setCurrentIndex(max(0, self.priority.findData(st["priority"])))
-        for bit, cb in self.mod_boxes.items():
-            cb.setChecked(bool(st["mods"] & bit))
+        self.mod_row.set_value(st["mods"])
         for w in widgets:
             w.blockSignals(False)
         self.update_mods_info()
@@ -189,18 +202,10 @@ class RecommendTab(QWidget):
 
         def done(res):
             self.recs = res["charts"]
+            self.table.clearContents()
             self.table.setRowCount(len(self.recs))
             for i, r in enumerate(self.recs):
-                self.table.setItem(i, 0, _item(r["label"]))
-                self.table.setItem(i, 1, _item(r["mods_label"], align=Qt.AlignCenter))
-                exp = _item(pct(r["expected"], 2), align=Qt.AlignCenter)
-                if not r["in_window"]:
-                    exp.setForeground(Qt.gray)
-                    exp.setToolTip("outside target ± 1%")
-                self.table.setItem(i, 2, exp)
-                for k, p in enumerate(r["priorities"]):
-                    self.table.setItem(i, 3 + k, _item(pct(p, 1), align=Qt.AlignCenter))
-                self.table.setItem(i, 8, _item("", editable=True, align=Qt.AlignCenter))
+                self.fill_row(i, r)
             self.result_info.setText(f"{res['in_window']} of {res['candidates']:,} charts searched are within "
                                      f"target ± 1%")
             self.submit_btn.setEnabled(bool(self.recs))
@@ -208,11 +213,38 @@ class RecommendTab(QWidget):
         run_task(self, "finding charts for you",
                  lambda p, c: self.state.recommend(settings, progress=p, cancelled=c), done)
 
+    def fill_row(self, i: int, r: dict):
+        t = self.table
+        info = r.get("info") or {}
+        urls = beatmap_urls(info)
+        for col in (self.COL_URL, self.COL_DIRECT):
+            t.setItem(i, col, _item(""))
+        if urls:
+            web, direct = urls
+            t.setCellWidget(i, self.COL_URL, link_button(web, "open the chart's page in your browser (download it there)",
+                                                         lambda _c=False, u=web: open_url(u)))
+            t.setCellWidget(i, self.COL_DIRECT, link_button(direct, "open the chart in the osu! client (osu!direct)",
+                                                            lambda _c=False, u=direct: open_url(u)))
+        t.setItem(i, self.COL_CHART, _item(""))
+        btn = link_button(r["label"], "click to copy 'artist title difficulty' for osu!'s search box", None, align_left=True)
+        btn.clicked.connect(lambda _c=False, b=btn, text=search_text(info) or r["label"]: copy_with_tip(b, text))
+        t.setCellWidget(i, self.COL_CHART, btn)
+        t.setItem(i, self.COL_MAPPER, _item(info.get("creator") or ""))
+        t.setItem(i, self.COL_MODS, _item(r["mods_label"], align=Qt.AlignCenter))
+        exp = _item(pct(r["expected"], 2), align=Qt.AlignCenter)
+        if not r["in_window"]:
+            exp.setForeground(Qt.gray)
+            exp.setToolTip("outside target ± 1 (percentage point): not enough charts were inside")
+        t.setItem(i, self.COL_EXPECTED, exp)
+        for k, p in enumerate(r["priorities"]):
+            t.setItem(i, self.COL_PRIORITY + k, _item(pct(p, 1), align=Qt.AlignCenter))
+        t.setItem(i, self.COL_ACC, _item("", editable=True, align=Qt.AlignCenter))
+
     def submit(self):
         rows = []
         try:
             for i, r in enumerate(self.recs):
-                it = self.table.item(i, 8)
+                it = self.table.item(i, self.COL_ACC)
                 acc = parse_percent(it.text() if it else "")
                 if acc is not None:
                     rows.append((r["ref"], r["mods"], acc))

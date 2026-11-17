@@ -147,7 +147,7 @@ def repository_files(root: Path = REPO_ROOT) -> list[Path]:
     files = []
     for p in root.rglob("*"):
         rel = p.relative_to(root)
-        if not p.is_file() or ALWAYS_SKIP_DIRS & set(rel.parts):
+        if not p.is_file() or ALWAYS_SKIP_DIRS & set(rel.parts) or rel.parts[0].startswith("dist"):
             continue
         if p == LOCAL_CONFIG or p.suffix == ".zip" or re.search(r"\.zip\.\d{3}$", p.name) or p.suffix == ".pyc":
             continue

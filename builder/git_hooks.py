@@ -23,7 +23,7 @@ import privacy_check as PC  # noqa: E402
 
 MAX_BYTES = 20 * 2**20              # source files are small; anything bigger is a mistake
 FORBIDDEN = [
-    (re.compile(r"^(dist|data|runtime)/"), "build output / app data"),
+    (re.compile(r"^(dist[^/]*|data|runtime)/"), "build output / app data"),
     (re.compile(r"(^|/)__pycache__/|\.py[co]$"), "compiled Python file"),
     (re.compile(r"^builder/local_paths\.json$"), "your private local paths"),
     (re.compile(r"\.(zip|zip\.\d{3}|pt|pth|npz|npy|sqlite|sqlite3|db|osz)$", re.I), "data/package file"),

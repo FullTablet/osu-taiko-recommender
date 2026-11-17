@@ -571,6 +571,12 @@ def test_git_setup(tmp: Path):
         check("CRLF" not in r.stderr and "LF will be replaced" not in r.stderr,
               "git setup: no line-ending warnings with Windows' autocrlf (.gitattributes)")
         check(not G.git_state(repo)["private_tracked"], "git setup: git add -A leaves local_paths.json out")
+        (repo / "dist_old" / "work").mkdir(parents=True)
+        (repo / "dist_old" / "work" / "notes.json").write_text("{}")
+        r = subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", "dist_old/work/notes.json"])
+        import git_hooks as GH
+        check(r.returncode == 0 and GH.path_problems("dist_old/work/notes.json") and not GH.path_problems("app/distance.py"),
+              "git setup: renamed build folders (dist_old/) are ignored by git and refused by the hooks")
         subprocess.run(["git", "-C", str(repo), "add", "-f", "builder/local_paths.json"], check=True, capture_output=True)
         check(any("tracked" in p for p in G.problems(G.git_state(repo))), "git setup: tracked local_paths.json reported")
         subprocess.run(["git", "-C", str(repo), "config", "user.email", "me" + chr(64) + "example.com"], check=True)
@@ -715,7 +721,7 @@ def test_private_downloads(tmp: Path, rel: Path, versions: dict):
 def test_gui(tmp: Path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     try:
-        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtCore import QCoreApplication, Qt
         from PySide6.QtWidgets import QApplication
     except ImportError:
         print("(PySide6 not installed: GUI check skipped)")
@@ -747,16 +753,115 @@ def test_gui(tmp: Path):
     rt.mod_boxes[256].setChecked(False)
     check(rt.target.minimum() > 0 and rt.target.maximum() < 100, "GUI: target accuracy strictly inside (0%, 100%)")
     before = win.state.user.count_plays()
-    check(rt.table.columnCount() == 9 and rt.table.horizontalHeaderItem(3).text() == "α",
-          "GUI: priority columns α–ε next to the expected accuracy")
-    rt.table.item(0, 8).setText("98.5")
-    rt.table.item(min(2, n - 1), 8).setText("91%")
+    heads = [rt.table.horizontalHeaderItem(c).text() for c in range(rt.table.columnCount())]
+    check(heads[:6] == ["URL", "osu!direct", "chart", "mapper", "mods", "expected accuracy"]
+          and heads[6:11] == ["α", "β", "γ", "δ", "ε"] and heads[11] == "your accuracy (%)",
+          "GUI: columns URL, osu!direct, chart, mapper, mods, expected, α–ε, your accuracy")
+    from PySide6.QtWidgets import QLabel as _QLabel, QPushButton as _QPushButton
+    labels = {w.text() for w in rt.findChildren(_QLabel)}
+    check("prioritize this skill" in labels and "charts to search" in labels and "charts to show" in labels
+          and not any("(K)" in t or "(S)" in t for t in labels), "GUI: settings labels without K/S")
+    r0 = rt.recs[0]
+    bid = r0["info"]["beatmap_id"]
+    url_btn = rt.table.cellWidget(0, rt.COL_URL)
+    direct_btn = rt.table.cellWidget(0, rt.COL_DIRECT)
+    check(isinstance(url_btn, _QPushButton) and url_btn.text() == f"https://osu.ppy.sh/b/{bid}"
+          and isinstance(direct_btn, _QPushButton) and direct_btn.text() == f"osu://b/{bid}",
+          "GUI: URL and osu!direct buttons with the chart's beatmap ID")
+    from taiko_gui.tabs import beatmap_urls
+    check(beatmap_urls({"beatmap_id": None}) is None and beatmap_urls({"beatmap_id": 0}) is None
+          and beatmap_urls({"beatmap_id": -1}) is None, "GUI: no links without a beatmap ID")
+    opened = []
+    from taiko_gui import widgets as _W
+    real_open = _W.QDesktopServices.openUrl
+    _W.QDesktopServices.openUrl = staticmethod(lambda u: opened.append(u.toString()))
+    try:
+        url_btn.click()
+        direct_btn.click()
+    finally:
+        _W.QDesktopServices.openUrl = real_open
+    check(opened == [f"https://osu.ppy.sh/b/{bid}", f"osu://b/{bid}"], "GUI: link buttons open their URLs")
+    chart_btn = rt.table.cellWidget(0, rt.COL_CHART)
+    chart_btn.click()
+    from PySide6.QtGui import QGuiApplication as _QGA
+    want = f'{r0["info"]["artist"]} {r0["info"]["title"]} {r0["info"]["version"]}'
+    check(isinstance(chart_btn, _QPushButton) and _QGA.clipboard().text() == want,
+          "GUI: clicking the chart name copies 'Artist Title Difficulty' to the clipboard")
+    from taiko_gui.tabs import search_text
+    check(search_text({"artist": "A", "title": None, "version": "Oni"}) == "A Oni", "GUI: copy text skips missing fields")
+    check(rt.table.item(0, rt.COL_MAPPER).text() == (r0["info"].get("creator") or ""), "GUI: mapper column")
+    check(isinstance(rt.table.itemDelegateForColumn(rt.COL_ACC), _W.EditableCellDelegate)
+          and rt.table.item(0, rt.COL_ACC).text() == "", "GUI: accuracy cells drawn as inputs, text starts empty")
+    fmt = _W.format_accuracy_shorthand
+    check([fmt(x) for x in ("97", "974", "7685", "100", "1000", "9", "12345", "97.5", "", "9x")]
+          == ["97.00", "97.40", "76.85", "100.00", "100.00", "9", "12345", "97.5", "", "9x"],
+          "GUI: accuracy shorthand 97 -> 97.00, 974 -> 97.40, 7685 -> 76.85 (only 2-4 digits)")
+    from PySide6.QtWidgets import QLineEdit as _QLineEdit
+    deleg = rt.table.itemDelegateForColumn(rt.COL_ACC)
+    ed = _QLineEdit()
+    ed.setText("7685")
+    deleg.setModelData(ed, rt.table.model(), rt.table.model().index(1, rt.COL_ACC))
+    check(rt.table.item(1, rt.COL_ACC).text() == "76.85", "GUI: typed '7685' is stored as '76.85'")
+    rt.table.item(1, rt.COL_ACC).setText("")
+    from PySide6.QtTest import QTest
+    rt.table.editItem(rt.table.item(1, rt.COL_ACC))
+    QCoreApplication.processEvents()
+    live = deleg.open_editor
+    live.setText("974")
+    QTest.mouseClick(rt.result_info, Qt.LeftButton)            # a label: takes no keyboard focus
+    QCoreApplication.processEvents()
+    check(live is not None and rt.table.item(1, rt.COL_ACC).text() == "97.40" and deleg.open_editor is None,
+          "GUI: clicking anywhere outside the accuracy box converts '974' to '97.40' at once")
+    rt.table.item(1, rt.COL_ACC).setText("")
+    rt.table.item(0, rt.COL_ACC).setText("98.5")
+    rt.table.item(min(2, n - 1), rt.COL_ACC).setText("91%")
     rt.submit()
     wait_tasks()
     after = win.state.user.count_plays()
     check(after == before + (2 if n > 2 else 1), "GUI: submitting stores the filled rows as plays")
     check(rt.table.rowCount() > 0 and win.state.current_skill()["method"] == "plays",
           "GUI: skill re-estimated and new recommendations shown")
+    dlg = _W.ChartPickerDialog(win.state, win)
+    dlg.query.setText(str(bid))
+    dlg.search()
+    dlg.results.setCurrentRow(0)
+    dlg.mod_row.set_value(0)
+    dlg.update_ok()
+    ok_nm = dlg.ok_button.isEnabled() and dlg.selection()[1] == 0
+    dlg.mod_row.boxes[1024].setChecked(True)                        # FL: never in the database
+    ok_fl = dlg.ok_button.isEnabled()
+    dlg.mod_row.boxes[1024].setChecked(False)
+    dlg.mod_row.boxes[64].setChecked(True)
+    dlg.mod_row.boxes[256].setChecked(True)                         # HT unchecks DT
+    check(ok_nm and not ok_fl and dlg.mod_row.value() == 256 and dlg.ok_button.isEnabled(),
+          "GUI: add-play dialog uses mod checkboxes, OK only for combinations the chart has")
+    dlg.mod_row.set_value(0)
+    dlg.update_ok()
+    cta = _W.check_typed_accuracy
+    check([cta(x) for x in ("97", "974", "7685", "100", "1000", "96854", "101.5", "97.25", "97,5 %", "5")]
+          == [(97.0, "97.00"), (97.4, "97.40"), (76.85, "76.85"), (100.0, "100.00"), (100.0, "100.00"),
+              (100.0, "100.00"), (100.0, "100.00"), (97.25, None), (97.5, None), (5.0, None)],
+          "GUI: add-play accuracy: shorthand and >100% need confirmation, plain values don't")
+    asked = []
+
+    def try_accuracy(text, answer):
+        asked.clear()
+        dlg.accepted_accuracy = None
+        dlg.setResult(0)
+        dlg.confirm_accuracy = lambda sug: asked.append(sug) or answer
+        dlg.acc.setText(text)
+        dlg.accept_if_valid()
+        return dlg.result(), dlg.accepted_accuracy
+
+    r_yes = try_accuracy("974", True)
+    yes_ok = r_yes == (1, 0.974) and asked == ["97.40"] and dlg.acc.text() == "97.40"
+    r_no = try_accuracy("96854", False)
+    no_ok = r_no == (0, None) and asked == ["100.00"]
+    r_plain = try_accuracy("97.25", True)
+    check(yes_ok and no_ok and r_plain == (1, 0.9725) and asked == [],
+          "GUI: add-play asks 'did you mean XX.XX%?' (yes adds it, no cancels); plain values skip the question")
+    check(dlg.selection()[2] == 0.9725, "GUI: add-play returns the confirmed accuracy")
+    dlg.close()
     win.plays.refresh()
     check(win.plays.table.rowCount() == after, "GUI: plays tab lists every play")
     win.charts.refresh()
