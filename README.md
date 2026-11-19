@@ -4,6 +4,17 @@ Estimates your osu!taiko skill in five dimensions (α, β, γ, δ, ε) from the 
 plays, and recommends charts that expose your weaknesses at the accuracy you're aiming for.
 The difficulty model is a neural network trained on the plays of the top 10,000 taiko players.
 
+The five skill dimensions aren't defined by hand: they come out of the training, which looks for
+whatever set of skills best predicts the accuracy players actually get. So they don't necessarily
+match the categories a person would come up with. From my own testing, this is how I'd describe
+them (better descriptions from more skilled players are welcome):
+
+- **α (alpha):** pattern complexity and density.
+- **β (beta):** raw speed and stamina.
+- **γ (gamma):** finger control at high speeds.
+- **δ (delta):** reading, especially slider velocity and rhythm changes.
+- **ε (epsilon):** rhythm complexity, keeping accuracy at lower speeds and high OD (overall difficulty).
+
 _chart data and statistics derived from osu! data (data.ppy.sh)_
 
 ## Install (Windows 10 or later)
@@ -112,7 +123,7 @@ Before the first release, set up the repository once with `python builder\git_se
 **Maths** (`app/taiko_core`, NumPy only):
 - **`skill.py`:**
   - Per-note logit `x = Σ slope_k (s_k − bias_k)`; chart expected accuracy = mean of sigmoid(x). The per-note confidence weight isn't used.
-  - **Skill estimate:** maximizes `Σ_plays w_p Σ_notes [acc_p·x − softplus(x)]` with `w = 1, 0.99, 0.99², …` over the newest 1,000 plays, by Newton's method (a few steps, well under a second).
+  - **Skill estimate:** maximizes `Σ_plays Σ_notes w·[acc_p·x − softplus(x)]` with a weight per note, `w = 0.99^((m−1)/650)`, where `m = 1` is the last note of the newest play and `m` counts notes backwards through the plays (newest 1,000 plays), minus `150 · Var(z₁, …, z₅)`, the sample variance of the five normal-equivalent scores `z_k = (s_k − median_k)/σ_k` (`σ_k` = interquartile range / 1.349, from the quantile table; weight `VARIANCE_WEIGHT` in `skill.py`), which pulls the estimate towards a balanced skill profile. `z` is affine in the skill, so the loss is convex and its minimum is global; solved by Newton's method (a few steps, well under a second).
   - **Weak prior:** a very weak Gaussian prior (precision 1) around the previous estimate keeps it finite if every play is 100%.
   - **`quantiles_for_accuracy`:** the quantiles `t·direction` from quantile 0 at which a chart's expected accuracy reaches a target, for example `[1,1,1,1,1]` or `[2,1,1,1,1]`. Bisection, extrapolating below 0 and above 1 when needed.
 - **`quantiles.py`:** direct (quantile → value) and reverse (value → quantile) lookups, linear between keypoints. Outside [0, 1], the line continues with the secant slope of the outer 1%, anchored at the end keypoint, so both directions are continuous at 0 and 1. Displayed percentiles can go below 0% or above 100%.

@@ -6,7 +6,6 @@ formula) -> normalized with the expansion pack's mean/std -> NumPy note subnet
 """
 from __future__ import annotations
 
-import io
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from .chartdb import ChartDB
+from .mods import mods_label
 from .osu.congregal import chart_parts
 from .osu.osu_reader import parse_osu_bytes
 from .osu.taiko_bo import OsuParseError, compute_bo_all, get_mode, parse_taiko_chart
@@ -41,6 +41,14 @@ class ImportSummary:
         return sum(r.status == "added" for r in self.results)
 
 
+def note_span_seconds(times) -> float:
+    """Chart length as shown in the app: first note to last note, breaks in between
+    included, intro and outro not (at normal speed; DT/HT are applied when shown)."""
+    if len(times) < 2:
+        return 0.0
+    return float((max(times) - min(times)) / 1000.0)
+
+
 def chart_info(chart, osu) -> dict:
     """Metadata row for an imported chart."""
     md = chart.metadata
@@ -53,7 +61,7 @@ def chart_info(chart, osu) -> dict:
             return None
 
     times = chart.circle_times
-    length = float((times.max() - times.min()) / 1000.0) if len(times) > 1 else 0.0
+    length = note_span_seconds(times)
     bpm = None
     unin = [(t, bl) for t, bl in chart.timing_points if bl > 0]
     if unin:
@@ -93,21 +101,29 @@ class ExpansionModel:
         self.model_id = cfg["model_id"]
         self.pipeline_version = cfg.get("pipeline_version", PIPELINE_VERSION)
 
-    def compute_variants(self, osu_bytes: bytes, file_name: str, mods_list, batch: int = 6):
-        """-> (chart, osu, {mods: (slope, bias)}). Raises NotTaikoError etc."""
+    def compute_variants(self, osu_bytes: bytes, file_name: str, mods_list, batch: int = 6, progress=None):
+        """-> (chart, osu, {mods: (slope, bias)}). Raises NotTaikoError etc.
+        progress(done, total, mods): called after each mod combination (then one
+        combination is computed at a time, so the progress bar moves for each)."""
         osu = parse_osu_bytes(osu_bytes, file_name)
         chart = parse_taiko_chart(osu)
         mods_list = sorted(set(int(m) for m in mods_list))
+        out = {}
+        if not mods_list:
+            return chart, osu, out
         bo = compute_bo_all(chart, legacy=False, mods_list=mods_list)
         parts = chart_parts(bo)
-        feats = {m: ((parts.features(m).astype(np.float64) - self.mean) / self.std).astype(np.float32)
-                 for m in mods_list}
-        out = {}
+        if progress is not None:
+            batch = 1
         for i in range(0, len(mods_list), batch):
             group = mods_list[i:i + batch]
-            slope, bias = self.net.forward(np.stack([feats[m] for m in group]))
+            x = np.stack([((parts.features(m).astype(np.float64) - self.mean) / self.std).astype(np.float32)
+                          for m in group])
+            slope, bias = self.net.forward(x)
             for j, m in enumerate(group):
                 out[m] = (slope[j], bias[j])
+                if progress is not None:
+                    progress(len(out), len(mods_list), m)
         return chart, osu, out
 
 
@@ -154,7 +170,14 @@ def import_files(paths, db: ChartDB, model: ExpansionModel, mods_list, progress=
                 if osu.file_md5 in have:
                     file_results.append(ImportResult(name, "duplicate", "already in your chart database"))
                     continue
-                chart, osu, variants = model.compute_variants(raw, fname, mods_list)
+                n_ent = max(len(entries), 1)
+
+                def mod_progress(done, total, m, fi=fi, ei=ei, n_ent=n_ent, name=name):
+                    if progress:
+                        progress((fi + (ei + done / total) / n_ent) / len(paths),
+                                 f"{name}\n{mods_label(m)} ({done}/{total})")
+
+                chart, osu, variants = model.compute_variants(raw, fname, mods_list, progress=mod_progress)
                 if chart.circle_times.size == 0:
                     file_results.append(ImportResult(name, "skipped", "the chart has no notes"))
                     continue
@@ -174,6 +197,32 @@ def import_files(paths, db: ChartDB, model: ExpansionModel, mods_list, progress=
     return summary
 
 
+def change_chart_mods(db: ChartDB, model, chart_id: int, add=(), remove=(), progress=None) -> dict:
+    """Compute the mod combinations in `add` for one imported chart (from its stored .osu)
+    and delete those in `remove`. progress(fraction, text) after each combination."""
+    add = sorted(set(int(m) for m in add) - set(db.mods_of(chart_id)))
+    remove = sorted(set(int(m) for m in remove))
+    added = 0
+    if add:
+        raw = db.osu_bytes(chart_id)
+        if raw is None:
+            raise ValueError("this chart has no stored .osu file, so new combinations can't be computed")
+        info = db.chart(chart_id) or {}
+
+        def mod_progress(done, total, m):
+            if progress:
+                progress(done / total, f"{mods_label(m)} ({done}/{total})")
+
+        _, _, variants = model.compute_variants(raw, info.get("file_name") or "chart.osu", add,
+                                                progress=mod_progress)
+        db.put_variants(chart_id, variants, commit=False)
+        added = len(variants)
+    if remove:
+        db.delete_variants(chart_id, remove, commit=False)
+    db.commit()
+    return {"added": added, "removed": len(remove)}
+
+
 def recompute_all(db: ChartDB, model: ExpansionModel, progress=None, cancelled=lambda: False) -> tuple[int, int]:
     """Recompute every imported chart from its stored .osu with the installed model
     (after a model change). Keeps each chart's mod selection."""
@@ -188,7 +237,13 @@ def recompute_all(db: ChartDB, model: ExpansionModel, progress=None, cancelled=l
         try:
             if raw is None:
                 raise ValueError("no stored .osu")
-            _, _, variants = model.compute_variants(raw, info.get("file_name") or "chart.osu", mods)
+
+            def mod_progress(done, total, m, i=i, title=info.get("title") or ""):
+                if progress:
+                    progress((i + done / total) / max(len(ids), 1), f"{title}\n{mods_label(m)} ({done}/{total})")
+
+            _, _, variants = model.compute_variants(raw, info.get("file_name") or "chart.osu", mods,
+                                                    progress=mod_progress)
             db.conn.execute("DELETE FROM variants WHERE chart_id = ?", (cid,))
             db.put_variants(cid, variants, commit=False)
             ok += 1

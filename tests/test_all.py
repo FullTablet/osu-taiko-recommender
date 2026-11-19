@@ -84,10 +84,13 @@ def test_skill():
     est, info = estimate_skill(plays, prior_mean=np.zeros(5), prior_precision=0.0)
     # the estimate must be the maximum of the recency-weighted likelihood ...
     from taiko_core.skill import sigmoid
-    w = recency_weights(len(plays))
-    grad = sum(wi * (p.slope.T @ (p.accuracy - sigmoid(p.slope @ est - (p.slope * p.bias).sum(1))))
-               for wi, p in zip(w, plays))
-    scale = sum(wi * len(p.slope) for wi, p in zip(w, plays))
+    w = recency_weights([len(p.slope) for p in plays])
+    ends = np.cumsum([len(p.slope) for p in plays])
+    grad, scale = 0.0, 0.0
+    for p, e in zip(plays, ends):
+        wn = w[e - len(p.slope):e]
+        grad = grad + p.slope.T @ (wn * (p.accuracy - sigmoid(p.slope @ est - (p.slope * p.bias).sum(1))))
+        scale += wn.sum()
     check(np.abs(grad).max() / scale < 1e-8, f"skill estimate is the likelihood maximum ({info['iterations']} Newton steps)")
     # ... and reproduce the observed accuracies about as well as the true skill does
     err_est = np.mean([abs(expected_accuracy(p.slope, p.bias, est) - p.accuracy) for p in plays])
@@ -95,8 +98,13 @@ def test_skill():
     perfect = [PlayData(p.slope, p.bias, 1.0) for p in plays[:3]]
     est2, _ = estimate_skill(perfect, prior_mean=np.zeros(5))
     check(np.all(np.isfinite(est2)), "skill estimate stays finite when every play is 100%")
-    w = recency_weights(4)
-    check(np.allclose(w, [0.99 ** 3, 0.99 ** 2, 0.99, 1.0]), "recency weights 1, 0.99, 0.99^2 ... (newest = 1)")
+    w = recency_weights([2, 3])                     # older play: 2 notes; newest play: 3 notes
+    check(np.allclose(w, 0.99 ** (np.array([4, 3, 2, 1, 0]) / 650)) and w[-1] == 1.0
+          and abs(recency_weights([651])[0] - 0.99) < 1e-15,
+          "recency weights per note: 0.99^((m-1)/650), m = 1 for the newest play's last note")
+    wa = recency_weights([400, 250])
+    check(abs(wa[0] - 0.99 ** (649 / 650)) < 1e-15 and abs(wa[399] - 0.99 ** (250 / 650)) < 1e-15,
+          "older play's notes weighted by their distance in notes from the newest note")
     many = [plays[0]] * 1200
     _, info3 = estimate_skill(many, prior_mean=np.zeros(5))
     check(info3["plays"] == 1000, "only the 1000 most recent plays are used")
@@ -107,6 +115,57 @@ def test_skill():
 
     samples = rng.normal(0, 1, (50_000, 5))
     qt = QuantileTable.from_samples(samples, 1000)
+    # ---- variance regularization: loss + VARIANCE_WEIGHT * Var(normal-equivalent scores)
+    from taiko_core import skill as SK
+    xs = np.array([0.37, -2.9, 3.4, 0.0, -0.81])
+    hstep = 1e-7
+    fd = np.array([(qt.quantile(k, xs[k] + hstep) - qt.quantile(k, xs[k] - hstep)) / (2 * hstep) for k in range(5)])
+    check(np.allclose(qt.quantile_slopes(xs), fd, rtol=1e-4), "quantile table: d quantile / d value (also in the tails)")
+    med, sig = qt.normal_scale()
+    check(np.allclose(med, qt.values_at(0.5)) and np.allclose(sig, 1.0, atol=0.05),
+          "normal scale of a table built from N(0, 1) samples: median ~0, sigma ~1")
+    few = plays[:4]
+    s0, _ = estimate_skill(few, prior_mean=np.zeros(5))
+    s0b, _ = estimate_skill(few, prior_mean=np.zeros(5), quantile_table=qt, variance_weight=0.0)
+    s1, i1 = estimate_skill(few, prior_mean=np.zeros(5), quantile_table=qt)
+    s2, _ = estimate_skill(few, prior_mean=np.zeros(5), quantile_table=qt, variance_weight=1e9)
+    var = lambda sk: float(np.var((sk - med) / sig, ddof=1))                          # noqa: E731
+    lam = SK.VARIANCE_WEIGHT
+    check(lam == 150.0 and np.allclose(s0, s0b) and var(s0) > var(s1) > var(s2)
+          and var(s2) < 1e-6 and abs(i1["variance_penalty"] - lam * var(s1)) < 1e-9,
+          "variance term: weight x Var(normal-equivalent scores, n-1) pulls them together; default 150")
+    # convex loss: the estimate doesn't depend on the start, even with an outlier keypoint
+    gap_samples = rng.normal(0, 1, (50_000, 5))
+    gap_samples[:3, 4] = -9.0
+    qt_gap = QuantileTable.from_samples(gap_samples, 1000)
+    gs = []
+    for start_q in ([0.4, 0.4, 0.4, 0.4, 0.0], [0.4, 0.4, 0.4, 0.4, 1.0], [0.4] * 5, [0.0] * 5, [0.9] * 5, [1.0] * 5):
+        sg, ig = estimate_skill(plays[:20], prior_mean=qt_gap.values_at(np.array(start_q)), prior_precision=0.0,
+                                quantile_table=qt_gap)
+        gs.append(sg)
+    spread = max(np.abs(g - gs[0]).max() for g in gs)
+    check(spread < 1e-6, f"regularized estimate is the same from every starting point (spread {spread:.1e})")
+    # optimality: the loss is smooth now, so its gradient must vanish at the estimate
+    cts = [len(p.slope) for p in few]
+    A = np.concatenate([p.slope for p in few])
+    C = np.concatenate([(p.slope * p.bias).sum(1) for p in few])
+    T = np.repeat([p.accuracy for p in few], cts)
+    W = recency_weights(cts)
+
+    def obj(sk):
+        x = A @ sk - C
+        return (W * (T * x - np.logaddexp(0, x))).sum() - 0.5 * (sk ** 2).sum() - lam * var(sk)
+
+    e = 1e-6
+    gnum = np.array([(obj(s1 + e * np.eye(5)[k]) - obj(s1 - e * np.eye(5)[k])) / (2 * e) for k in range(5)])
+    check(np.abs(gnum).max() < 1e-4 * W.sum(), f"regularized skill estimate is the optimum (|gradient| {np.abs(gnum).max():.1e})")
+    # convexity: the loss along random lines through the estimate is convex (second differences >= 0)
+    convex = True
+    for dvec in rng.normal(0, 1, (20, 5)):
+        ts = np.linspace(-0.5, 0.5, 41)
+        vals = np.array([-obj(s1 + t * dvec) for t in ts])
+        convex &= bool(np.all(np.diff(vals, 2) > -1e-6))
+    check(convex, "the regularized loss is convex along random lines (so the minimum is global)")
     slope, bias = plays[0].slope, plays[0].bias
     for direction in ([1, 1, 1, 1, 1], [2, 1, 1, 1, 1], [0, 1, 0, 0, 0]):
         q = quantiles_for_accuracy(slope, bias, qt, direction, 0.9)
@@ -255,6 +314,95 @@ def test_chartdb(tmp: Path):
     check(blob <= 700 * 10, f"8-bit storage: {blob:,} bytes for 700 notes x 10 values (<= 1 byte each)")
 
 
+def test_replace_dir(tmp: Path):
+    from taiko_core import packages as P
+
+    root = tmp / "swap"
+    dest, new = root / "base", root / ".base_new"
+    for d, text in ((dest, "old"), (new, "new")):
+        d.mkdir(parents=True)
+        (d / "f.txt").write_text(text)
+    (root / "base.old").mkdir()                                 # leftover of an earlier failed update
+    (root / "base.old" / "junk").write_text("x")
+    P.replace_dir(new, dest, "base")
+    check((dest / "f.txt").read_text() == "new" and not new.exists() and not list(root.glob("base.old*")),
+          "packages: new folder swapped in, old and stale leftovers removed")
+    new.mkdir()
+    (new / "f.txt").write_text("newer")
+    real_rename = Path.rename
+    calls = []
+
+    def flaky(self, target):
+        if self == new:
+            calls.append(1)
+            raise PermissionError(5, "Access is denied")
+        return real_rename(self, target)
+
+    Path.rename = flaky
+    try:
+        P.replace_dir(new, dest, "base", attempts=3, delay=0.01)
+        err = None
+    except P.PackageError as e:
+        err = str(e)
+    finally:
+        Path.rename = real_rename
+    check(err is not None and "in use" in err and len(calls) == 3 and (dest / "f.txt").read_text() == "new",
+          "packages: a folder that stays locked gives a clear error and keeps the installed version")
+
+
+def test_ssl_context():
+    import builtins
+    import ssl
+
+    from taiko_core import packages as P
+
+    ctx = P.ssl_context()
+    check(ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname, "downloads: certificates are verified")
+    real_import = builtins.__import__
+
+    def no_truststore(name, *a, **k):
+        if name == "truststore":
+            raise ImportError("simulated")
+        return real_import(name, *a, **k)
+
+    builtins.__import__ = no_truststore
+    try:
+        fallback = P.ssl_context()
+    finally:
+        builtins.__import__ = real_import
+    try:
+        import certifi  # noqa: F401
+        has_certifi = True
+    except ImportError:
+        has_certifi = False
+    check(fallback.verify_mode == ssl.CERT_REQUIRED and
+          (not has_certifi or fallback.cert_store_stats()["x509_ca"] > 0),
+          "downloads: without truststore, the certifi root list is used")
+    handlers = [h for h in P._opener.handlers if isinstance(h, __import__("urllib.request").request.HTTPSHandler)]
+    check(len(handlers) == 1 and handlers[0]._context.verify_mode == ssl.CERT_REQUIRED,
+          "downloads: the opener uses that certificate check")
+    e = P.urllib.error.URLError(ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"))
+    check("Install.bat" in P._hint(e), "downloads: certificate errors explain what to do")
+
+
+def test_curve():
+    from taiko_core import curve as CV
+
+    k = CV.gaussian_kernel(2)
+    check(len(k) == 5 and abs(k.sum() - 1) < 1e-12 and abs(k[1] / k[2] - np.exp(-0.5)) < 1e-12,
+          "details curve: Gaussian radius 2 (5 taps, sd 1, like GaussianFilter[data, 2])")
+    v = np.array([0.0, 0, 0, 0, 10])
+    sm = CV.smooth(v)
+    manual_last = (k[0] * 0 + k[1] * 0 + k[2] * 10 + k[3] * 10 + k[4] * 10)
+    check(np.allclose(CV.smooth(np.full(7, 0.9)), 0.9) and abs(sm[-1] - manual_last) < 1e-12 and len(sm) == 5,
+          "details curve: ends padded by repeating the extreme values")
+    h = CV.hue_for_z([-5, -2, 0, 2, 5, 1])
+    check(list(h[:5]) == [0, 0, 60, 220, 220] and 60 < h[5] < 220, "details curve: red <= -2 sd, yellow at the mean, blue >= +2 sd, smooth between")
+    c = CV.colors([-2, 0, 2])
+    check(c[0][0] > 200 and c[0][2] < 30 and c[1][0] > 200 and c[1][1] > 200 and c[2][2] > 200 and c[2][0] < 80,
+          "details curve: the colours are red, yellow and blue")
+
+
 def test_mods():
     from taiko_core.mods import BASE_MODS, DEFAULT_IMPORT_MODS, mods_label, parse_mods_label
 
@@ -263,6 +411,16 @@ def test_mods():
     check(len(DEFAULT_IMPORT_MODS) == 18 and all(not m & 1024 for m in DEFAULT_IMPORT_MODS),
           "default import selection: the 18 combinations without FL")
     check(parse_mods_label("HD+NC") == 72 and parse_mods_label("nm") == 0, "mod label parsing")
+    from taiko_core.mods import DT, HD, HT, format_length, played_length
+    check([format_length(x) for x in (0, 59.6, 205, 3600, 5194, None)] == ["00:00", "01:00", "03:25", "60:00",
+                                                                          "86:34", ""],
+          "length shown as mm:ss, minutes past an hour (86:34)")
+    check(played_length(180, 0) == 180 and played_length(180, DT | HD) == 120 and played_length(180, HT) == 240,
+          "length: DT plays 1.5x faster (180 s -> 2:00), HT 0.75x (180 s -> 4:00)")
+    from taiko_core.importer import note_span_seconds
+    import numpy as _np
+    check(note_span_seconds(_np.array([61000.0, 1000.0, 20000.0])) == 60.0 and note_span_seconds(_np.array([5.0])) == 0.0,
+          "imported charts: length = first to last note (breaks in between included)")
 
 
 # ------------------------------------------------------------------------------ torch-based checks
@@ -307,6 +465,21 @@ def write_dump(dump: Path, bids):
         encoding="utf-8")
 
 
+def write_osu(path: Path, bid: int, first_ms: int, last_ms: int):
+    """A minimal taiko .osu: notes from first_ms to last_ms with a long gap (a break) in between."""
+    times = [first_ms, first_ms + 500, first_ms + 1000, last_ms - 1000, last_ms - 500, last_ms]
+    objs = "\n".join(f"256,192,{t},1,{(i % 2) * 2}" for i, t in enumerate(times))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("osu file format v14\n\n[General]\nMode: 1\n\n[Metadata]\nTitle:T\nArtist:A\nCreator:Mapper\n"
+                    f"Version:D\nBeatmapID:{bid}\n\n[Difficulty]\nOverallDifficulty:5\nHPDrainRate:5\n"
+                    "SliderMultiplier:1.4\n\n[Events]\n2,30000,60000\n\n[TimingPoints]\n0,500,4,1,0,100,1,0\n\n"
+                    f"[HitObjects]\n{objs}\n", encoding="utf-8")
+
+
+def expected_length(bid: int) -> float:
+    return (bid * 1000 + 100_000 + 3_000) / 1000.0         # last - first in write_osu calls below
+
+
 def test_end_to_end(tmp: Path):
     import test_build_training_data as T
     from taiko_core.mods import BASE_MODS
@@ -321,6 +494,9 @@ def test_end_to_end(tmp: Path):
     BTD.main(["--plays_db", str(d / "plays.sqlite"), "--congregal_db", str(d / "congregals.sqlite"),
               "--old_data_dir", str(inp["old"]), "--out_dir", str(d / "dataset"), "--old_checkpoint", str(ckpt)])
     write_dump(d / "dump", range(1, 12))
+    for bid in range(1, 12):                         # one file in a subfolder: found by name too
+        sub = d / "osu" / ("nested" if bid == 3 else "") / f"{bid}.osu"
+        write_osu(sub, bid, 2_000, 2_000 + bid * 1000 + 100_000 + 3_000)
     import make_release as MR
     import release_all as RA
 
@@ -330,6 +506,7 @@ def test_end_to_end(tmp: Path):
     RA.CONGREGAL_DB = d / "congregals.sqlite"
     RA.PLAYS_DB = d / "plays.sqlite"
     RA.DUMP_DIR = d / "dump"
+    RA.OSU_DIR = d / "osu"
     RA.DIST = dist
     RA.REPO = "someone/otr"
     RA.main(["--app_version", "0.1.0", "--data_version", "2026.11.1", "--tag", "v1"])
@@ -356,7 +533,14 @@ def test_end_to_end(tmp: Path):
     check(cdb.count() == 8 and info["title"] == "Title 4" and info["version"] == "Diff (it's) 4" and
           cdb.mods_of(info["chart_id"]) == sorted(BASE_MODS) and info["status"] == 1,
           "base charts: the 8 eligible beatmaps with metadata and the 8 base mod combinations")
+    lens = {r["beatmap_id"]: r["length_s"] for r in cdb.search("", 100)}
+    check(all(abs(lens[b] - expected_length(b)) < 1e-6 for b in lens) and 3 in lens,
+          "base charts: length = first to last note (breaks included) from the .osu files, nested ones too")
     cdb.close()
+    import build_base_package as BBP
+    of = BBP.OsuFiles(d / "osu")
+    check(of.path(4) == d / "osu" / "4.osu" and of.path(3) == d / "osu" / "nested" / "3.osu" and of.path(99) is None
+          and BBP.OsuFiles(None).path(4) is None, "base build: .osu files found by beatmap ID, missing ones give no length")
     qj = json.loads((dist / "base" / "skill_quantiles.json").read_text())
     check(len(qj["values"]) == 5 and len(qj["values"][0]) == 1000 and qj["meta"]["n_samples"] > 100,
           "skill quantile table: 5 dimensions x 1000 keypoints from the plays")
@@ -371,6 +555,8 @@ def test_end_to_end(tmp: Path):
         scripts = [z.read(n) for n in names if n.lower().endswith((".bat", ".ps1"))]
     check(len(scripts) >= 2 and all(b.count(b"\n") == b.count(b"\r\n") > 0 for b in scripts),
           "release: Windows scripts in the app zip have CRLF line endings")
+    check("osu!taiko recommender/app/assets/icon.ico" in names and "osu!taiko recommender/app/assets/icon.png" in names,
+          "release: app zip includes the icon")
     check("osu!taiko recommender/Install.bat" in names and "osu!taiko recommender/app/main.py" in names and
           cfg["github_repo"] == "someone/otr" and not any("__pycache__" in n for n in names),
           "release: app zip 'osu!taiko recommender/' with Install.bat and the configured repo")
@@ -754,9 +940,9 @@ def test_gui(tmp: Path):
     check(rt.target.minimum() > 0 and rt.target.maximum() < 100, "GUI: target accuracy strictly inside (0%, 100%)")
     before = win.state.user.count_plays()
     heads = [rt.table.horizontalHeaderItem(c).text() for c in range(rt.table.columnCount())]
-    check(heads[:6] == ["URL", "osu!direct", "chart", "mapper", "mods", "expected accuracy"]
-          and heads[6:11] == ["α", "β", "γ", "δ", "ε"] and heads[11] == "your accuracy (%)",
-          "GUI: columns URL, osu!direct, chart, mapper, mods, expected, α–ε, your accuracy")
+    check(heads[:7] == ["URL", "osu!direct", "chart", "mapper", "length", "mods", "expected accuracy"]
+          and heads[7:12] == ["α", "β", "γ", "δ", "ε"] and heads[12:] == ["details", "your accuracy (%)"],
+          "GUI: columns URL, osu!direct, chart, mapper, length, mods, expected, α–ε, details, your accuracy")
     from PySide6.QtWidgets import QLabel as _QLabel, QPushButton as _QPushButton
     labels = {w.text() for w in rt.findChildren(_QLabel)}
     check("prioritize this skill" in labels and "charts to search" in labels and "charts to show" in labels
@@ -781,6 +967,24 @@ def test_gui(tmp: Path):
     finally:
         _W.QDesktopServices.openUrl = real_open
     check(opened == [f"https://osu.ppy.sh/b/{bid}", f"osu://b/{bid}"], "GUI: link buttons open their URLs")
+    from taiko_core.app_state import ChartRef as _ChartRef
+    n_rows = rt.table.rowCount()
+    rt.table.setRowCount(n_rows + 1)
+    rt.fill_row(n_rows, dict(r0, ref=_ChartRef("comp", 1)))           # same chart, as if imported
+    iu, idr = rt.table.cellWidget(n_rows, rt.COL_URL), rt.table.cellWidget(n_rows, rt.COL_DIRECT)
+    opened.clear()
+    _W.QDesktopServices.openUrl = staticmethod(lambda u: opened.append(u.toString()))
+    try:
+        iu.click()
+        idr.click()
+    finally:
+        _W.QDesktopServices.openUrl = real_open
+    check("color: gray" in iu.styleSheet() and "color: gray" in idr.styleSheet() and iu.isEnabled()
+          and "imported charts" in iu.toolTip() and "imported charts" in idr.toolTip()
+          and "color: gray" not in url_btn.styleSheet() and "imported" not in url_btn.toolTip()
+          and opened == [f"https://osu.ppy.sh/b/{bid}", f"osu://b/{bid}"],
+          "GUI: imported charts' links are grey but work, and their tooltip warns about the beatmap ID")
+    rt.table.setRowCount(n_rows)
     chart_btn = rt.table.cellWidget(0, rt.COL_CHART)
     chart_btn.click()
     from PySide6.QtGui import QGuiApplication as _QGA
@@ -789,7 +993,79 @@ def test_gui(tmp: Path):
           "GUI: clicking the chart name copies 'Artist Title Difficulty' to the clipboard")
     from taiko_gui.tabs import search_text
     check(search_text({"artist": "A", "title": None, "version": "Oni"}) == "A Oni", "GUI: copy text skips missing fields")
+    check(search_text({"artist": "Kobaryo", "title": "Yura-Yura Sweet Genocide [feat. t+pazolite]", "version": "Muzukashii"})
+          == "Kobaryo Yura-Yura Sweet Genocide feat. t+pazolite Muzukashii"
+          and search_text({"artist": "A", "title": "B", "version": "[Inner Oni]"}) == "A B Inner Oni",
+          "GUI: copy text drops square brackets (osu!'s search treats [..] as a difficulty filter)")
     check(rt.table.item(0, rt.COL_MAPPER).text() == (r0["info"].get("creator") or ""), "GUI: mapper column")
+    from taiko_core.mods import format_length as _fl, played_length as _pl
+    check(rt.table.item(0, rt.COL_LENGTH).text() == _fl(_pl(r0["info"]["length_s"], r0["mods"]))
+          and len(rt.table.item(0, rt.COL_LENGTH).text()) == 5, "GUI: length column (mm:ss at the mods' speed)")
+    check(heads[-2] == "details" and rt.COL_DETAILS == len(heads) - 2
+          and rt.table.cellWidget(0, rt.COL_DETAILS).text() == "click here!",
+          "GUI: 'details' column (second from the right) with 'click here!' buttons")
+    from PySide6.QtCore import QEvent as _QEvent
+    from taiko_gui.details import ChartDetailsDialog
+    inf = r0["info"]
+    base_head = f"{inf['artist']} - {inf['title']} [{inf['version']}] mapped by {inf['creator']}"
+    opened_ok = []
+    for attempt in range(3):                       # open, close, open again (closing deletes the window)
+        rt.table.cellWidget(0, rt.COL_DETAILS).click()
+        wait_tasks()
+        dd = rt._detail_windows[-1] if rt._detail_windows else None
+        opened_ok.append(isinstance(dd, ChartDetailsDialog) and dd.isVisible())
+        if attempt < 2:
+            dd.close()
+            QCoreApplication.sendPostedEvents(None, _QEvent.DeferredDelete)
+            QCoreApplication.processEvents()
+    check(all(opened_ok) and len(rt._detail_windows) == 1,
+          "GUI: the details window opens again after being closed (closed ones are forgotten)")
+    n_mods = len(win.state.db(r0["ref"].source).mods_of(r0["ref"].chart_id))
+    heads_ok = dd.head.text() == base_head and r0["mods"] == 0           # NM: no '+ NM'
+    rows_ok = dd.table.rowCount() == n_mods and dd.table.columnCount() == 9 \
+        and dd.table.horizontalHeaderItem(7).text() == "plot" and dd.table.cellWidget(0, 7).text() == "click here" \
+        and dd.table.horizontalHeaderItem(8).text() == "add to list" and dd.table.cellWidget(0, 8).text() == "add"
+    curve_ok = dd.curve.n == inf["n_notes"] and abs(dd.curve.mean - r0["expected"]) < 1e-9
+
+    def bold_rows():
+        return [dd.table.item(i, 0).text() for i in range(dd.table.rowCount()) if dd.table.item(i, 0).font().bold()]
+
+    first_bold = bold_rows()
+    check(heads_ok and rows_ok and curve_ok and first_bold == ["NM"],
+          "GUI: details window: header without '+ NM', per-note curve (mean = expected accuracy), every mod combination")
+    dt_row = next(i for i in range(dd.table.rowCount()) if dd.table.item(i, 0).text() == "HDDT")
+    old_mean = dd.curve.mean
+    dd.table.cellWidget(dt_row, 7).click()
+    want_mean = float(np.mean(dd.details["rows"][dt_row]["per_note"]))
+    check(dd.head.text() == base_head + " + HDDT" and bold_rows() == ["HDDT"] and abs(dd.curve.mean - want_mean) < 1e-12
+          and abs(dd.curve.mean - old_mean) > 0 and abs(want_mean - float(dd.table.item(dt_row, 1).text()[:-1]) / 100) < 6e-5,
+          "GUI: 'plot' buttons switch the header and the curve to that mod combination")
+    from PySide6.QtCore import QPointF as _QPointF
+    from PySide6.QtGui import QMouseEvent as _QMouseEvent
+    from PySide6.QtWidgets import QToolTip as _QToolTip
+    rect = dd.curve.plot_rect()
+    k = 3
+    pos = _QPointF(rect.left() + k / (dd.curve.n - 1) * rect.width(), rect.center().y())
+    ev = _QMouseEvent(_QEvent.MouseMove, pos, dd.curve.mapToGlobal(pos), Qt.NoButton, Qt.NoButton, Qt.NoModifier)
+    shown = []
+    real_show = _QToolTip.showText
+    _QToolTip.showText = staticmethod(lambda _p, text, *a, **kw: shown.append(text))
+    try:
+        dd.curve.mouseMoveEvent(ev)
+    finally:
+        _QToolTip.showText = real_show
+    raw_k = dd.details["rows"][dt_row]["per_note"][k]
+    check(shown == [f"note {k + 1}: {raw_k * 100:.2f}% expected"] and abs(raw_k - dd.curve.y[k]) > 0,
+          "GUI: hovering the graph shows the real (unsmoothed) expected accuracy of the note")
+    n_recs = len(rt.recs)
+    dd.table.cellWidget(dt_row, 8).click()                     # add HDDT to the list
+    QCoreApplication.processEvents()
+    added = rt.recs[-1] if len(rt.recs) == n_recs + 1 else None
+    import shiboken6
+    closed = not shiboken6.isValid(dd) or not dd.isVisible()
+    check(added is not None and added["mods"] == 72 and added["ref"] == r0["ref"] and closed
+          and rt.table.rowCount() == n_recs + 1 and rt.table.item(n_recs, rt.COL_MODS).text() == "HDDT",
+          "GUI: details 'add' buttons append the chart with that mod combination to the list and close the window")
     check(isinstance(rt.table.itemDelegateForColumn(rt.COL_ACC), _W.EditableCellDelegate)
           and rt.table.item(0, rt.COL_ACC).text() == "", "GUI: accuracy cells drawn as inputs, text starts empty")
     fmt = _W.format_accuracy_shorthand
@@ -813,6 +1089,55 @@ def test_gui(tmp: Path):
     check(live is not None and rt.table.item(1, rt.COL_ACC).text() == "97.40" and deleg.open_editor is None,
           "GUI: clicking anywhere outside the accuracy box converts '974' to '97.40' at once")
     rt.table.item(1, rt.COL_ACC).setText("")
+    # ---- adding a chart by hand at the bottom of the list
+    from taiko_gui import tabs as _TT
+    btn_order = [rt.get_btn, rt.add_btn]
+    lay_ok = all(b.isEnabled() for b in btn_order) and rt.add_btn.x() > rt.get_btn.x()
+    base_db = win.state.base
+    all_ids = [r["chart_id"] for r in base_db.search("", 100)]
+    no_hd = set(all_ids[:3])                                     # pretend these lack HD
+    real_mods_of = type(base_db).mods_of
+    type(base_db).mods_of = lambda self, cid: [m for m in real_mods_of(self, cid) if not (cid in no_hd and m == 8)]
+    try:
+        sd = _W.ChartSearchDialog(win.state, 8, win)
+        sd.query.setText("")
+        sd.search()
+        flags = [(sd.results.item(i).data(Qt.UserRole) is None, sd.results.item(i)) for i in range(sd.results.count())]
+        reds = [f for f, _ in flags]
+        red_items = [it for f, it in flags if f]
+        order_ok = reds == sorted(reds) and sum(reds) == len(no_hd)
+        red_ok = all(not (it.flags() & Qt.ItemIsSelectable) and it.foreground().color().red() > 150
+                     and "no HD version" in it.toolTip() for it in red_items)
+        sd.results.setCurrentItem(red_items[0])
+        cant_pick = sd.selected_ref() is None and not sd.ok_button.isEnabled()
+        sd.results.setCurrentRow(0)
+        can_pick = sd.selected_ref() is not None and sd.ok_button.isEnabled()
+        sd.close()
+    finally:
+        type(base_db).mods_of = real_mods_of
+    check(lay_ok and order_ok and red_ok and cant_pick and can_pick,
+          "GUI: 'add a chart' search: charts lacking the selected mods are red, unselectable, with a tooltip, listed last")
+    n_before = rt.table.rowCount()
+    pick_bid = r0["info"]["beatmap_id"]
+
+    def fake_exec(self):
+        self.query.setText(str(pick_bid))
+        self.search()
+        self.results.setCurrentRow(0)
+        return 1
+
+    real_exec = _TT.ChartSearchDialog.exec
+    _TT.ChartSearchDialog.exec = fake_exec
+    try:
+        rt.add_chart()
+    finally:
+        _TT.ChartSearchDialog.exec = real_exec
+    last = rt.recs[-1]
+    check(rt.table.rowCount() == n_before + 1 and len(rt.recs) == n_before + 1
+          and last["info"]["beatmap_id"] == pick_bid and last["mods"] == rt.selected_mods()
+          and rt.table.cellWidget(n_before, rt.COL_DETAILS) is not None
+          and abs(last["expected"] - win.state.expected_accuracy(last["ref"], last["mods"])) < 1e-12,
+          "GUI: 'add a chart' appends the picked chart (with the selected mods) at the bottom of the list")
     rt.table.item(0, rt.COL_ACC).setText("98.5")
     rt.table.item(min(2, n - 1), rt.COL_ACC).setText("91%")
     rt.submit()
@@ -821,9 +1146,72 @@ def test_gui(tmp: Path):
     check(after == before + (2 if n > 2 else 1), "GUI: submitting stores the filled rows as plays")
     check(rt.table.rowCount() > 0 and win.state.current_skill()["method"] == "plays",
           "GUI: skill re-estimated and new recommendations shown")
+    from taiko_gui.widgets import format_change, skill_text
+    cur_sk = win.state.current_skill()
+    prev_sk = win.state.user.previous_skill()
+    want_change = cur_sk["quantiles"] - win.state.quantiles.quantiles_of(prev_sk["skill"])
+    lab0 = rt.skill.labels[0].text()
+    check(cur_sk["change"] is not None and np.allclose(cur_sk["change"], want_change)
+          and lab0.startswith(f"{cur_sk['quantiles'][0] * 100:.2f}%") and format_change(want_change[0]) in lab0
+          and "color:gray" in lab0 and "change since the previous estimate" in rt.skill.note.text(),
+          "GUI: skill panel shows each percentile with its change since the previous estimate")
+    check([format_change(x) for x in (0.032, -0.0105, 0.0, 0.00004)] == ["+3.20%", "−1.05%", "±0.00%", "±0.00%"]
+          and skill_text(0.4665, None, 12) == "46.65%", "GUI: change format +3.20% / −1.05% / ±0.00%; none without a previous estimate")
+    # ---- unsubmitted plays when asking for new recommendations
+    asked_n = []
+
+    def run_with(choice):
+        rt.ask_unsubmitted = lambda n: asked_n.append(n) or choice
+        rt.table.item(0, rt.COL_ACC).setText("95")
+        before_plays, before_recs = win.state.user.count_plays(), list(rt.recs)
+        rt.get_recommendations()
+        wait_tasks()
+        return before_plays, before_recs
+
+    bp, br = run_with("cancel")
+    cancel_ok = (win.state.user.count_plays() == bp and rt.recs == br and rt.table.item(0, rt.COL_ACC).text() == "95"
+                 and asked_n == [1])
+    bp, br = run_with("discard")
+    discard_ok = win.state.user.count_plays() == bp and rt.recs is not br and rt.typed_rows() == 0
+    bp, br = run_with("submit")
+    submit_ok = win.state.user.count_plays() == bp + 1 and rt.typed_rows() == 0 and len(rt.recs) > 0
+    # submit chosen, but one accuracy is invalid: warning, nothing recorded, no search
+    from taiko_gui import tabs as _TT2
+    warned = []
+    real_warning = _TT2.QMessageBox.warning
+    _TT2.QMessageBox.warning = staticmethod(lambda *a, **k: warned.append(a[1:3]))
+    try:
+        rt.ask_unsubmitted = lambda n: "submit"
+        rt.table.item(0, rt.COL_ACC).setText("97")
+        rt.table.item(1, rt.COL_ACC).setText("abc")
+        rt.table.item(2, rt.COL_ACC).setText("101")
+        bp, br = win.state.user.count_plays(), list(rt.recs)
+        rt.get_recommendations()
+        wait_tasks()
+    finally:
+        _TT2.QMessageBox.warning = real_warning
+    sel_rows = sorted({ix.row() for ix in rt.table.selectedIndexes()})
+    invalid_ok = (win.state.user.count_plays() == bp and rt.recs == br and len(warned) == 1
+                  and warned[0][0] == "invalid accuracies" and "row 2" in warned[0][1] and "row 3" in warned[0][1]
+                  and "row 1:" not in warned[0][1] and "no new recommendations were searched" in warned[0][1]
+                  and sel_rows == [1, 2] and rt.table.item(0, rt.COL_ACC).text() == "97")
+    check(invalid_ok, "GUI: submitting with invalid accuracies warns (listing them), records nothing and doesn't search")
+    for i in range(3):
+        rt.table.item(i, rt.COL_ACC).setText("")
+    asked_n.clear()
+    rt.get_recommendations()                        # nothing typed: no question
+    wait_tasks()
+    del rt.ask_unsubmitted
+    check(cancel_ok and discard_ok and submit_ok and asked_n == [],
+          "GUI: typed but unsubmitted accuracies: cancel keeps them, discard drops them, submit records them; "
+          "both then get new recommendations")
     dlg = _W.ChartPickerDialog(win.state, win)
     dlg.query.setText(str(bid))
     dlg.search()
+    first = dlg.results.item(0).text()
+    binfo = win.state.chart_info(dlg.results.item(0).data(Qt.UserRole))
+    check(first == f"{binfo['artist']} - {binfo['title']} [{binfo['version']}] (ranked #{bid}) mapped by {binfo['creator']}",
+          "GUI: add-play list shows 'Artist - Title [Diff] (ranked #id) mapped by Mapper'")
     dlg.results.setCurrentRow(0)
     dlg.mod_row.set_value(0)
     dlg.update_ok()
@@ -862,13 +1250,146 @@ def test_gui(tmp: Path):
           "GUI: add-play asks 'did you mean XX.XX%?' (yes adds it, no cancels); plain values skip the question")
     check(dlg.selection()[2] == 0.9725, "GUI: add-play returns the confirmed accuracy")
     dlg.close()
+    from taiko_core import packages as _P
+    from taiko_gui import tabs as _T
+    seen = {}
+
+    def fake_download(entry, kind, progress=None, cancelled=lambda: False):
+        seen["base_open"] = win.state.base is not None
+        raise _P.PackageError("simulated failure")
+
+    real_dl, real_warn = _P.download_package, _T.QMessageBox.warning
+    _P.download_package = fake_download
+    _T.QMessageBox.warning = staticmethod(lambda *a, **k: seen.setdefault("warned", a[2] if len(a) > 2 else ""))
+    try:
+        win.updates.remote = {"base": {"version": "x", "model_id": win.state.model_id, "parts": []}}
+        win.updates.download("base")
+        wait_tasks()
+    finally:
+        _P.download_package, _T.QMessageBox.warning = real_dl, real_warn
+    check(seen.get("base_open") is False and win.state.has_base and seen.get("warned") == "simulated failure",
+          "GUI: package files are closed before an update replaces them, and reopened if it fails")
     win.plays.refresh()
-    check(win.plays.table.rowCount() == after, "GUI: plays tab lists every play")
+    # speed: filling the visible plays table must not re-measure every row per cell
+    import random as _random
+    refs_all = [r for r, _ in win.state.search("")]
+    win.state.record_plays([(_random.choice(refs_all), 0, 0.95) for _ in range(300)])
+    win.tabs.setCurrentWidget(win.plays)                      # switching tabs refreshes the shown tab
+    QCoreApplication.processEvents()
+    t0 = _time.time()
+    win.plays.refresh()
+    QCoreApplication.processEvents()
+    dt = _time.time() - t0
+    from PySide6.QtWidgets import QHeaderView as _QHV
+    hdr = win.plays.table.horizontalHeader()
+    check(dt < 1.0 and win.plays.table.rowCount() == win.state.user.count_plays()
+          and hdr.sectionResizeMode(1) == _QHV.Stretch and hdr.sectionResizeMode(0) == _QHV.ResizeToContents
+          and win.plays.table.updatesEnabled(),
+          f"GUI: my plays with {win.plays.table.rowCount()} plays fills in {dt:.2f} s (was ~6 s for 200), column sizing kept")
+    win.tabs.setCurrentWidget(win.recommend)
+    ph = [win.plays.table.horizontalHeaderItem(c).text() for c in range(win.plays.table.columnCount())]
+    pm = {win.plays.table.item(r, 2).text() for r in range(win.plays.table.rowCount())}
+    check(ph == ["#", "chart", "mapper", "mods", "accuracy", "entered"] and pm and "" not in pm,
+          "GUI: my plays has a mapper column, filled for every play")
+    # edit a play: mods (checkboxes) and accuracy
+    pt = win.plays
+    pt.table.clearSelection()
+    pt.table.selectRow(0)
+    pid = pt.table.item(0, 1).data(Qt.UserRole)
+    seen_dlg = {}
+
+    def fake_edit(dlg):
+        dlg.mod_row.set_value(1024)                              # FL: not in the database
+        dlg.update_ok()
+        seen_dlg["fl_blocked"] = not dlg.ok_button.isEnabled() and "isn't available" in dlg.mods_note.text()
+        dlg.mod_row.boxes[8].setChecked(True)                    # HD ...
+        dlg.mod_row.boxes[1024].setChecked(False)
+        dlg.mod_row.boxes[64].setChecked(True)                   # ... + DT = HDDT
+        seen_dlg["hddt_ok"] = dlg.ok_button.isEnabled()
+        dlg.confirm_accuracy = lambda sug: True
+        dlg.acc.setText("9750")                                  # shorthand -> 97.50 after confirmation
+        dlg.accept_if_valid()
+        return dlg.result() == 1
+
+    pt.exec_dialog = fake_edit
+    pt.edit_play()
+    del pt.exec_dialog
+    edited = next(p for p in win.state.user.plays() if p["play_id"] == pid)
+    check(seen_dlg.get("fl_blocked") and seen_dlg.get("hddt_ok") and edited["mods"] == 72
+          and abs(edited["accuracy"] - 0.975) < 1e-12 and pt.edit_btn.text() == "edit play…"
+          and pt.table.item(0, 3).text() == "HDDT",
+          "GUI: editing a play changes its mods (checkboxes, only combinations the chart has) and accuracy")
+    # ---- imported charts: per-mod progress, and adding/removing mod combinations
+    from taiko_core.importer import import_files as _import_files
+    osu_path = tmp / "imp" / "777001.osu"
+    write_osu(osu_path, 777001, 1_000, 61_000)
+    prog = []
+    summ = _import_files([osu_path], win.state.ensure_comp(), win.state.model(), [0, 8, 16],
+                         progress=lambda f, t: prog.append((f, t)))
+    mod_steps = [t for f, t in prog if "/3)" in t]
+    fr = [f for f, _ in prog]
+    check(summ.added == 1 and len(mod_steps) == 3 and fr == sorted(fr) and "NM (1/3)" in mod_steps[0]
+          and "HR (3/3)" in mod_steps[-1], "import: the progress bar advances for each mod combination")
+    win.state.reload()
+    ct = win.charts
+    ct.refresh()
+    import hashlib as _hl
+    comp = win.state.comp
+    cid = comp.find(file_md5=_hl.md5(osu_path.read_bytes()).hexdigest())[0]
+    row = next(i for i in range(ct.table.rowCount()) if ct.table.item(i, 0).data(Qt.UserRole) == cid)
+    seen_cm = {}
+
+    def fake_mods_dialog(dlg, confirm=True):
+        dlg.selector.boxes[8].setChecked(False)                  # remove HD (computed)
+        dlg.selector.boxes[64].setChecked(True)                  # add DT
+        seen_cm["summary"] = dlg.summary.text()
+        asked = []
+        dlg.confirm_remove = lambda removed: asked.append(list(removed)) or confirm
+        dlg.accept_if_valid()
+        seen_cm["asked"] = asked
+        return dlg.result() == 1
+
+    ct.exec_dialog = lambda dlg: fake_mods_dialog(dlg, confirm=False)
+    ct.edit_mods(row)
+    wait_tasks()
+    unchanged = comp.mods_of(cid) == [0, 8, 16] and seen_cm["asked"] == [[8]]
+    ct.exec_dialog = lambda dlg: fake_mods_dialog(dlg, confirm=True)
+    ct.edit_mods(row)
+    wait_tasks()
+    del ct.exec_dialog
+    changed = comp.mods_of(cid) == [0, 16, 64] and "compute: DT" in seen_cm["summary"] and "remove: HD" in seen_cm["summary"]
+    from taiko_gui.widgets import ChartModsDialog as _CMD
+    empty_dlg = _CMD("x", [0], True)
+    empty_dlg.selector.boxes[0].setChecked(False)
+    check(unchanged and changed and not empty_dlg.ok_button.isEnabled(),
+          "my charts: double-click adds/removes mod combinations; removing computed ones asks first (no = nothing changes)")
+    ch = [win.charts.table.horizontalHeaderItem(c).text() for c in range(win.charts.table.columnCount())]
+    check(ch[:2] == ["chart", "mapper"], "GUI: my charts has a mapper column")
+    check(win.plays.table.rowCount() == win.state.user.count_plays(), "GUI: plays tab lists every play")
     win.charts.refresh()
     win.updates.refresh()
     check("base database: 2026.11.1" in win.updates.installed.text() and
           "data.ppy.sh" in win.updates.installed.text(), "GUI: updates tab shows installed versions and the data credit")
     check(win.windowTitle().startswith("osu!taiko recommender"), "GUI: window title 'osu!taiko recommender'")
+    from taiko_gui.main_window import rank_dialog
+    rd = rank_dialog(win, 12345)
+    txt = rd.labelText()
+    check(rd.intValue() == 12345 and "rough estimate" in txt and "my plays" in txt and "represent your true skill" in txt
+          and all(lab.wordWrap() for lab in rd.findChildren(_QLabel)),
+          "GUI: pp rank window explains it's a rough estimate and suggests adding representative plays")
+    rd.show()
+    QCoreApplication.processEvents()
+    rd.grab().save(str(tmp / "rank.png"))
+    rd.close()
+    import main as _main
+    ic = _main.app_icon()
+    sizes = {(sz.width(), sz.height()) for sz in ic.availableSizes()}
+    check(not ic.isNull() and (16, 16) in sizes and (256, 256) in sizes, "GUI: app icon loads with small and large sizes")
+    from PIL import Image as _Image
+    meta = {k for f in ("icon.png", "icon.ico") for k in _Image.open(_main.ICON_DIR / f).info if k not in ("sizes", "dpi")}
+    check(not meta, "GUI: icon files carry no embedded metadata (e.g. generation text)")
+    check(rt.skill.title() == "your skill (percentile among all plays by the top 10,000 players)",
+          "GUI: skill panel says percentiles are among all plays by the top 10,000 players")
     win.close()
 
 
@@ -876,10 +1397,13 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="taikoskill_test_"))
     try:
         test_mods()
+        test_curve()
         test_quantiles()
         test_skill()
         test_recommend_math()
         test_chartdb(tmp)
+        test_replace_dir(tmp)
+        test_ssl_context()
         test_git_setup(tmp)
         try:
             import torch  # noqa: F401

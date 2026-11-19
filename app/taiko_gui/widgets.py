@@ -18,9 +18,28 @@ def pct(q: float, digits: int = 1) -> str:
     return f"{q * 100:.{digits}f}%"
 
 
+def format_change(dq: float) -> str:
+    """Change of a percentile in percentage points: '+3.20%', '−1.05%', '±0.00%'."""
+    v = round(dq * 100, 2)
+    if v == 0:
+        return "±0.00%"
+    return f"+{v:.2f}%" if v > 0 else f"−{-v:.2f}%"
+
+
+def skill_text(q: float, dq: float | None, point_size: float) -> str:
+    """'46.65%' plus, if known, the change since the previous estimate in a smaller,
+    fainter, non-bold font (rich text)."""
+    main = f"{q * 100:.2f}%"
+    if dq is None:
+        return main
+    small = max(point_size * 0.6, 7.0)
+    return (f"{main}<span style='font-size:{small:.1f}pt; font-weight:normal; color:gray;'>"
+            f"&nbsp;{format_change(dq)}</span>")
+
+
 class SkillPanel(QGroupBox):
     def __init__(self, state, parent=None):
-        super().__init__("your skill (percentile among top-10,000 plays)", parent)
+        super().__init__("your skill (percentile among all plays by the top 10,000 players)", parent)
         self.state = state
         lay = QGridLayout(self)
         self.labels = []
@@ -32,6 +51,7 @@ class SkillPanel(QGroupBox):
             lay.addWidget(head, 0, i, alignment=Qt.AlignCenter)
             lab = QLabel("-")
             lab.setAlignment(Qt.AlignCenter)
+            lab.setTextFormat(Qt.RichText)
             f = lab.font()
             f.setPointSize(f.pointSize() + 4)
             f.setBold(True)
@@ -50,10 +70,12 @@ class SkillPanel(QGroupBox):
                 lab.setText("-")
             self.note.setText("no skill estimate yet")
             return
-        for lab, q in zip(self.labels, cur["quantiles"]):
-            lab.setText(pct(q))
+        change = cur.get("change")
+        for k, (lab, q) in enumerate(zip(self.labels, cur["quantiles"])):
+            lab.setText(skill_text(q, None if change is None else change[k], lab.font().pointSizeF()))
         how = "from your pp rank" if cur["method"] == "rank" else f"from your last {cur['n_plays']} plays"
-        self.note.setText(f"estimated {how} ({cur['created_at']})")
+        since = "; small numbers: change since the previous estimate" if change is not None else ""
+        self.note.setText(f"estimated {how} ({cur['created_at']}){since}")
 
 
 class ModSelector(QWidget):
@@ -113,13 +135,15 @@ class ModCheckRow(QWidget):
             cb.blockSignals(False)
 
 
-def link_button(text: str, tooltip: str, on_click, align_left: bool = False) -> QPushButton:
-    """A small push button used inside table cells (links and copy-to-clipboard)."""
+def link_button(text: str, tooltip: str, on_click, align_left: bool = False, muted: bool = False) -> QPushButton:
+    """A small push button used inside table cells (links and copy-to-clipboard).
+    muted: grey text, but the button works as usual."""
     b = QPushButton(text)
     b.setToolTip(tooltip)
     b.setCursor(Qt.PointingHandCursor)
     b.setAutoDefault(False)
-    b.setStyleSheet("QPushButton { padding: 1px 8px; %s }" % ("text-align: left;" if align_left else ""))
+    b.setStyleSheet("QPushButton { padding: 1px 8px; %s%s }" % ("text-align: left; " if align_left else "",
+                                                                 "color: gray;" if muted else ""))
     if on_click is not None:
         b.clicked.connect(on_click)
     return b
@@ -259,6 +283,93 @@ class _OutsideClickWatcher(QObject):
 
 
 
+def picker_label(ref, info: dict) -> str:
+    """'Artist - Title [Diff] (ranked #123) mapped by Someone' for the add-play list."""
+    if ref.source == "base":
+        ident = f"ranked #{info.get('beatmap_id')}"
+    else:
+        ident = f"imported {(info.get('file_md5') or '')[:10]}"
+    mapper = f" mapped by {info['creator']}" if info.get("creator") else ""
+    return f"{chart_label(info)} ({ident}){mapper}"
+
+
+class ChartSearchDialog(QDialog):
+    """Pick one chart to add to the recommendations list, with the mods already chosen in
+    the recommendation settings. Charts without that mod combination are red, can't be
+    picked, and are listed after the others."""
+    UNAVAILABLE = QColor(200, 30, 30)
+
+    def __init__(self, state, mods: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("add a chart to the list")
+        self.resize(760, 520)
+        self.state, self.mods = state, mods
+        lay = QVBoxLayout(self)
+        note = QLabel(f"mods: {mods_label(mods)} (from your recommendation settings). charts in red don't have "
+                      "this combination in the database.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray")
+        lay.addWidget(note)
+        row = QHBoxLayout()
+        self.query = QLineEdit()
+        self.query.setPlaceholderText("beatmap ID, file hash (imported charts) or words from artist/title/difficulty/mapper")
+        btn = QPushButton("search")
+        btn.setAutoDefault(False)
+        row.addWidget(self.query)
+        row.addWidget(btn)
+        lay.addLayout(row)
+        self.results = QListWidget()
+        self.results.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.results.setMouseTracking(True)
+        lay.addWidget(self.results)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.ok_button = buttons.button(QDialogButtonBox.Ok)
+        self.ok_button.setText("add to the list")
+        self.ok_button.setEnabled(False)
+        lay.addWidget(buttons)
+        btn.clicked.connect(self.search)
+        self.query.returnPressed.connect(self.search)
+        self.results.itemSelectionChanged.connect(self.update_ok)
+        self.results.itemDoubleClicked.connect(lambda _it: self.accept_if_valid())
+        buttons.accepted.connect(self.accept_if_valid)
+        buttons.rejected.connect(self.reject)
+
+    def search(self):
+        self.results.clear()
+        found = self.state.search(self.query.text())
+        ok, missing = [], []
+        for ref, info in found:
+            has = self.mods in self.state.db(ref.source).mods_of(ref.chart_id)
+            (ok if has else missing).append((ref, info))
+        for ref, info in ok:
+            item = QListWidgetItem(picker_label(ref, info))
+            item.setData(Qt.UserRole, ref)
+            self.results.addItem(item)
+        for ref, info in missing:                                   # always below the usable ones
+            item = QListWidgetItem(picker_label(ref, info))
+            item.setData(Qt.UserRole, None)
+            item.setForeground(self.UNAVAILABLE)
+            item.setFlags(Qt.ItemIsEnabled)                         # shown (with tooltip) but not selectable
+            item.setToolTip(f"this chart has no {mods_label(self.mods)} version in the database")
+            self.results.addItem(item)
+        if not found:
+            item = QListWidgetItem("no charts found")
+            item.setFlags(Qt.ItemIsEnabled)
+            self.results.addItem(item)
+        self.update_ok()
+
+    def selected_ref(self):
+        items = self.results.selectedItems()
+        return items[0].data(Qt.UserRole) if items else None
+
+    def update_ok(self):
+        self.ok_button.setEnabled(self.selected_ref() is not None)
+
+    def accept_if_valid(self):
+        if self.selected_ref() is not None:
+            self.accept()
+
+
 class ChartPickerDialog(QDialog):
     """Search a chart (base: beatmap ID or words; imported: file hash or words), pick
     mods and enter the accuracy."""
@@ -309,9 +420,7 @@ class ChartPickerDialog(QDialog):
     def search(self):
         self.results.clear()
         for ref, info in self.state.search(self.query.text()):
-            src = "ranked" if ref.source == "base" else "imported"
-            ident = f"#{info['beatmap_id']}" if ref.source == "base" else (info.get("file_md5") or "")[:10]
-            item = QListWidgetItem(f"{chart_label(info)}   ({src} {ident})")
+            item = QListWidgetItem(picker_label(ref, info))
             item.setData(Qt.UserRole, ref)
             self.results.addItem(item)
         if self.results.count() == 0:
@@ -379,3 +488,161 @@ class ChartPickerDialog(QDialog):
         if ref is None or mods not in self.available:
             return None
         return ref, mods, self.accepted_accuracy
+
+
+class EditPlayDialog(QDialog):
+    """Change a recorded play: its mod combination (checkboxes) and accuracy. Only
+    combinations the chart has in the database can be chosen (when the chart is found)."""
+
+    def __init__(self, state, play: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("edit play")
+        self.state, self.play = state, play
+        ref = state.resolve_play(play)
+        self.available = list(state.db(ref.source).mods_of(ref.chart_id)) if ref is not None else None
+        lay = QVBoxLayout(self)
+        title = QLabel(play.get("label") or "")
+        title.setWordWrap(True)
+        tf = title.font()
+        tf.setBold(True)
+        title.setFont(tf)
+        lay.addWidget(title)
+        form = QFormLayout()
+        self.mod_row = ModCheckRow(int(play["mods"]))
+        self.mods_note = QLabel("")
+        self.mods_note.setStyleSheet("color: gray")
+        mods_box = QVBoxLayout()
+        mods_box.addWidget(self.mod_row)
+        mods_box.addWidget(self.mods_note)
+        form.addRow("mods", mods_box)
+        self.acc = QLineEdit(f"{play['accuracy'] * 100:.2f}")
+        self.acc.setValidator(QRegularExpressionValidator(QRegularExpression(r"^\s*\d{0,9}([.,]\d{0,6})?\s*%?\s*$")))
+        self.acc.setMaximumWidth(160)
+        form.addRow("accuracy (%)", self.acc)
+        lay.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.ok_button = buttons.button(QDialogButtonBox.Ok)
+        lay.addWidget(buttons)
+        buttons.accepted.connect(self.accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        self.mod_row.changed.connect(self.update_ok)
+        self.result_mods: int | None = None
+        self.result_accuracy: float | None = None
+        self.update_ok()
+        self.resize(560, self.sizeHint().height())
+
+    def update_ok(self):
+        mods = self.mod_row.value()
+        if self.available is None:
+            self.mods_note.setText("this chart isn't in the database right now, so the combination can't be checked")
+            ok = True
+        else:
+            avail = ", ".join(mods_label(m) for m in self.available)
+            ok = mods in self.available
+            self.mods_note.setText(f"available for this chart: {avail}" if ok else
+                                   f"{mods_label(mods)} isn't available for this chart (available: {avail or 'none'})")
+        self.ok_button.setEnabled(ok)
+
+    def confirm_accuracy(self, suggestion: str) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle("check the accuracy")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"did you mean to type {suggestion}%?")
+        yes = box.addButton(f"yes, use {suggestion}%", QMessageBox.AcceptRole)
+        box.addButton("no, cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        return box.clickedButton() is yes
+
+    def accept_if_valid(self):
+        if not self.ok_button.isEnabled():
+            return
+        try:
+            value, suggestion = check_typed_accuracy(self.acc.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "accuracy", str(e) if "accuracy" in str(e) else "that isn't a valid accuracy")
+            self.acc.setFocus()
+            return
+        if suggestion is not None:
+            if not self.confirm_accuracy(suggestion):
+                self.acc.setFocus()
+                self.acc.selectAll()
+                return
+            self.acc.setText(suggestion)
+        self.result_mods = self.mod_row.value()
+        self.result_accuracy = round(value / 100.0, 8)
+        self.accept()
+
+
+class ChartModsDialog(QDialog):
+    """Add or remove the computed mod combinations of one imported chart."""
+
+    def __init__(self, label: str, existing, can_compute: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("mod combinations of this chart")
+        self.existing = sorted(int(m) for m in existing)
+        lay = QVBoxLayout(self)
+        title = QLabel(label)
+        title.setWordWrap(True)
+        tf = title.font()
+        tf.setBold(True)
+        title.setFont(tf)
+        lay.addWidget(title)
+        note = QLabel("checked = computed. check combinations to compute them, uncheck to remove them."
+                      + ("" if can_compute else "\nnew combinations can't be computed right now (the matching "
+                                                "expansion pack isn't installed); you can still remove some."))
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray")
+        lay.addWidget(note)
+        self.selector = ModSelector(self.existing)
+        if not can_compute:
+            for m, cb in self.selector.boxes.items():
+                cb.setEnabled(m in self.existing)
+        lay.addWidget(self.selector)
+        self.summary = QLabel("")
+        lay.addWidget(self.summary)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.ok_button = buttons.button(QDialogButtonBox.Ok)
+        lay.addWidget(buttons)
+        buttons.accepted.connect(self.accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        for cb in self.selector.boxes.values():
+            cb.toggled.connect(lambda _c: self.update_summary())
+        self.update_summary()
+
+    def to_add(self) -> list[int]:
+        return [m for m in self.selector.selected() if m not in self.existing]
+
+    def to_remove(self) -> list[int]:
+        chosen = set(self.selector.selected())
+        return [m for m in self.existing if m not in chosen]
+
+    def update_summary(self):
+        add, rem = self.to_add(), self.to_remove()
+        parts = []
+        if add:
+            parts.append("compute: " + ", ".join(mods_label(m) for m in add))
+        if rem:
+            parts.append("remove: " + ", ".join(mods_label(m) for m in rem))
+        empty = not self.selector.selected()
+        self.summary.setText("keep at least one combination" if empty else ("; ".join(parts) or "no changes"))
+        self.summary.setStyleSheet("color: rgb(200, 30, 30)" if empty else "")
+        self.ok_button.setEnabled(not empty and bool(add or rem))
+
+    def confirm_remove(self, removed: list[int]) -> bool:
+        names = ", ".join(mods_label(m) for m in removed)
+        return QMessageBox.warning(
+            self, "remove computed combinations",
+            f"remove {len(removed)} combination{'s' if len(removed) != 1 else ''} that "
+            f"{'are' if len(removed) != 1 else 'is'} already computed ({names})?\n\n"
+            "recommendations with them won't include this chart any more, and plays on them are left out of "
+            "your skill. you can compute them again later.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+    def accept_if_valid(self):
+        if not self.ok_button.isEnabled():
+            return
+        removed = self.to_remove()
+        if removed and not self.confirm_remove(removed):
+            return
+        self.accept()

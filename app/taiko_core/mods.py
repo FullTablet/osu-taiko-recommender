@@ -18,6 +18,30 @@ def mods_label(mods: int) -> str:
     return "".join(name for bit, name in order if mods & bit)
 
 
+def speed_factor(mods: int) -> float:
+    """Playback speed: DT 1.5x, HT 0.75x, otherwise 1x."""
+    if mods & DT:
+        return 1.5
+    if mods & HT:
+        return 0.75
+    return 1.0
+
+
+def played_length(length_s, mods: int) -> float | None:
+    """Chart length in real seconds with this mod combination (DT shortens it, HT lengthens it)."""
+    if length_s is None:
+        return None
+    return float(length_s) / speed_factor(mods)
+
+
+def format_length(seconds) -> str:
+    """mm:ss; minutes keep counting past an hour (86:34). Empty for unknown lengths."""
+    if seconds is None or seconds != seconds or seconds < 0:
+        return ""
+    total = int(round(seconds))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
 def parse_mods_label(text: str) -> int:
     """Inverse of mods_label; accepts 'NM', 'HDDT', 'HD+DT', 'hd dt', 'NC' (= DT), 'DC' (= HT)."""
     t = text.upper().replace("+", "").replace(" ", "").replace(",", "")

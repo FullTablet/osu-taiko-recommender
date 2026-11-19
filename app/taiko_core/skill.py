@@ -7,12 +7,46 @@ Model (same as training, without the per-note confidence weight W_j):
     chart expected accuracy = mean_j p_j
 
 Skill estimation maximizes the recency-weighted Bernoulli log-likelihood
-    sum_plays w_p sum_notes [ S_p x_pj - softplus(x_pj) ]   (S_p = play accuracy in [0, 1])
-with w = 1, 0.99, 0.99^2, ... from the most recent play backwards (at most 1000
-plays). It is concave in s, so Newton's method converges in a few steps. A very
-weak Gaussian prior around a reference skill (default: the previous estimate)
-keeps the estimate finite when every play is 100% (or 0%); with real play counts
-it has no visible effect.
+    sum_plays sum_notes w_pj [ S_p x_pj - softplus(x_pj) ]   (S_p = play accuracy in [0, 1])
+with a weight per NOTE (decision of 2026-11-18; before, each whole play had 0.99^(n-1)):
+    w = 0.99 ^ ((m - 1) / 650)
+where m counts notes backwards in time: m = 1 is the last note of the most recent
+play, m = 2 the note before it, ..., continuing into the previous plays. So the
+weight falls by a factor 0.99 every 650 notes, and a long play fades more than a
+short one. At most the 1000 most recent plays are used (by then the weights are
+negligible anyway).
+
+Regularization (decisions of 2026-11-18): the loss to minimize is
+
+    -(weighted log-likelihood above) + VARIANCE_WEIGHT * Var(z_1, ..., z_5)
+    z_k = (s_k - median_k) / sigma_k            (normal-equivalent score of dimension k)
+
+median_k and sigma_k come from the quantile table: the median, and the interquartile
+range / 1.349, i.e. z is the normal score (probit of the quantile) the skill would have if
+dimension k were normally distributed. Var is the sample variance over the five
+dimensions (divided by 5 - 1, like Mathematica's Variance). It pulls the dimensions
+towards each other (a balanced player), more strongly the fewer notes there are.
+
+Why z is AFFINE in s (and not the exact probit of the quantile): with z affine, the
+penalty is a convex quadratic in s, the log-likelihood is concave, so the whole loss is
+strictly convex: any local minimum is THE global minimum, and Newton's method converges
+to it from anywhere. A penalty on the quantiles themselves (tried first, weight 4000)
+made the loss non-convex (the quantile mapping is S-shaped, nearly flat at both ends) and
+the solver could stop in a worse local minimum; the exact probit of the quantile is not
+affine either (the skill distributions are not normal), so it gives no guarantee.
+Trade-off: the distributions have long upper tails, so near the top z grows faster than
+the probit (e.g. a dimension at the 99th percentile can have z 3-7 instead of 2.33): top
+players' imbalances are penalized more than with exact normal scores.
+
+VARIANCE_WEIGHT = 150 (2026-11-18, after testing; first 4000 / (2 pi) ~ 637, which was
+about as strong as the weight 4000 on quantiles near the median, where dz/dq = sqrt(2 pi)). The term is added to the weighted SUM over
+notes, not to an average: with a long play history the weights add up to about
+650 / -ln(0.99) ~ 65,000 notes.
+
+Newton's method (with backtracking): the penalty's Hessian is the constant
+VARIANCE_WEIGHT * 2/(5-1) * D (I - 11'/5) D, D = diag(1/sigma_k). A very weak Gaussian
+prior around a reference skill (default: the previous estimate) keeps the estimate finite
+when every play is 100% (or 0%); with real play counts it has no visible effect.
 """
 from __future__ import annotations
 
@@ -20,8 +54,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-RECENCY_DECAY = 0.99
+RECENCY_DECAY = 0.99        # weight factor ...
+RECENCY_NOTES = 650.0       # ... per this many notes, counted backwards from the newest note
 MAX_PLAYS = 1000
+VARIANCE_WEIGHT = 150.0     # weight of Var(normal-equivalent scores); see the docstring
 PRIOR_PRECISION = 1.0       # in skill units^-2; one note at p=0.5 with slope 1 has curvature 0.25
 
 
@@ -54,32 +90,50 @@ class PlayData:
     accuracy: float          # 0..1
 
 
-def recency_weights(n_plays: int, decay: float = RECENCY_DECAY) -> np.ndarray:
-    """Weights for plays ordered OLDEST first: the last (most recent) gets 1."""
-    return decay ** np.arange(n_plays - 1, -1, -1, dtype=np.float64)
+def recency_weights(note_counts, decay: float = RECENCY_DECAY, span: float = RECENCY_NOTES) -> np.ndarray:
+    """Per-note weights for plays ordered OLDEST first (notes in chart order), concatenated:
+    the last note of the most recent play gets 1, the m-th note counting backwards gets
+    decay ** ((m - 1) / span)."""
+    n = int(np.sum(note_counts))
+    return decay ** (np.arange(n - 1, -1, -1, dtype=np.float64) / span)
 
 
 def estimate_skill(plays: list[PlayData], prior_mean, prior_precision: float = PRIOR_PRECISION,
                    decay: float = RECENCY_DECAY, max_plays: int = MAX_PLAYS, max_iter: int = 100,
+                   span: float = RECENCY_NOTES, quantile_table=None, variance_weight: float = VARIANCE_WEIGHT,
                    tol: float = 1e-9, progress=None) -> tuple[np.ndarray, dict]:
-    """plays: oldest first. Returns (skill vector, info)."""
+    """plays: oldest first. Returns (skill vector, info). The variance regularization
+    needs the quantile table; without one (quantile_table=None) it is left out."""
     prior_mean = np.asarray(prior_mean, np.float64)
     plays = plays[-max_plays:]
     if not plays:
         return prior_mean.copy(), {"iterations": 0, "notes": 0, "plays": 0}
-    w_play = recency_weights(len(plays), decay)
     a = np.concatenate([np.asarray(p.slope, np.float64) for p in plays])                  # (N, D)
     c = np.concatenate([(np.asarray(p.slope, np.float64) * np.asarray(p.bias, np.float64)).sum(1)
                         for p in plays])                                                   # (N,)
     counts = [len(p.slope) for p in plays]
     target = np.repeat([float(p.accuracy) for p in plays], counts)
-    w = np.repeat(w_play, counts)
+    w = recency_weights(counts, decay, span)                                              # (N,) per note
     d = a.shape[1]
+    lam = float(variance_weight) if quantile_table is not None else 0.0
+    centering = np.eye(d) - np.full((d, d), 1.0 / d)
+    if lam:
+        median, sigma = quantile_table.normal_scale()
+        inv_sigma = 1.0 / sigma
+        pen_h = lam * (2.0 / (d - 1)) * (inv_sigma[:, None] * centering * inv_sigma[None, :])   # constant
 
-    def objective(s):
+    def scores(s):
+        return (s - median) * inv_sigma
+
+    def variance_penalty(s):
+        if lam == 0.0:
+            return 0.0
+        return lam * float(np.var(scores(s), ddof=1))
+
+    def objective(s):                                       # maximized (= minus the loss): concave
         x = a @ s - c
         ll = (w * (target * x - np.logaddexp(0.0, x))).sum()
-        return ll - 0.5 * prior_precision * ((s - prior_mean) ** 2).sum()
+        return ll - 0.5 * prior_precision * ((s - prior_mean) ** 2).sum() - variance_penalty(s)
 
     s = prior_mean.copy()
     f = objective(s)
@@ -89,21 +143,29 @@ def estimate_skill(plays: list[PlayData], prior_mean, prior_precision: float = P
         p = sigmoid(x)
         g = a.T @ (w * (target - p)) - prior_precision * (s - prior_mean)
         h = (a * (w * p * (1 - p))[:, None]).T @ a + prior_precision * np.eye(d)        # = -Hessian
+        if lam:
+            z = scores(s)
+            g = g - lam * (2.0 / (d - 1)) * inv_sigma * (z - z.mean())
+            h = h + pen_h
         step = np.linalg.solve(h, g)
         t = 1.0
         while True:                                                                      # backtracking
             s_new = s + t * step
             f_new = objective(s_new)
-            if f_new >= f - 1e-12 or t < 1e-8:
+            if f_new >= f - 1e-12:
+                break
+            if t < 1e-8:                             # rounding level: nothing better along the step
+                s_new, f_new = s, f
                 break
             t *= 0.5
-        converged = abs(f_new - f) <= tol * (1 + abs(f)) and np.abs(t * step).max() < 1e-7
+        converged = abs(f_new - f) <= tol * (1 + abs(f)) and np.abs(s_new - s).max() < 1e-7
         s, f = s_new, f_new
         if progress:
             progress(min(it / 20, 0.99))
         if converged:
             break
-    return s, {"iterations": it, "notes": int(len(target)), "plays": len(plays), "log_likelihood": float(f)}
+    return s, {"iterations": it, "notes": int(len(target)), "plays": len(plays), "objective": float(f),
+               "variance_penalty": variance_penalty(s)}
 
 
 # --------------------------------------------------------------------------- pp rank -> quantile

@@ -9,6 +9,29 @@ from taiko_core.app_state import AppState
 from .tabs import ChartsTab, PlaysTab, RecommendTab, UpdatesTab
 
 
+RANK_TEXT = (
+    "what's your global osu!taiko pp rank?\n\n"
+    "your pp rank only gives a rough estimate of your skill: it puts every skill dimension "
+    "at the same percentile, while real players are stronger in some than in others.\n\n"
+    "for a better estimate, add a few plays that you think represent your true skill in the "
+    "\"my plays\" tab (\"add play…\"), or play the recommended charts and submit the accuracy "
+    "you got. each play refines the estimate.")
+
+
+def rank_dialog(parent, default: int) -> QInputDialog:
+    dlg = QInputDialog(parent)
+    dlg.setWindowTitle("your rank")
+    dlg.setInputMode(QInputDialog.IntInput)
+    dlg.setIntRange(1, 10_000_000)
+    dlg.setIntStep(1)
+    dlg.setIntValue(default)
+    dlg.setLabelText(RANK_TEXT)
+    for lab in dlg.findChildren(QLabel):                 # long text: wrap it in a wider dialog
+        lab.setWordWrap(True)
+    dlg.setMinimumWidth(520)
+    return dlg
+
+
 class MainWindow(QMainWindow):
     def __init__(self, state: AppState | None = None):
         super().__init__()
@@ -28,8 +51,14 @@ class MainWindow(QMainWindow):
         credit = QLabel(packages.ATTRIBUTION)
         credit.setStyleSheet("color: gray")
         self.statusBar().addPermanentWidget(credit)
-        self.tabs.currentChanged.connect(lambda _i: self.refresh_all())
+        self.tabs.currentChanged.connect(lambda _i: self.refresh_current())
         self.refresh_all()
+
+    def refresh_current(self):
+        """Switching tabs: only the tab being shown needs fresh contents."""
+        tab = self.tabs.currentWidget()
+        if hasattr(tab, "refresh"):
+            tab.refresh()
 
     def refresh_all(self):
         for t in (self.recommend, self.plays, self.charts, self.updates):
@@ -60,10 +89,7 @@ class MainWindow(QMainWindow):
             return
         if self.state.user.current_skill() is not None and not force:
             return
-        rank, ok = QInputDialog.getInt(
-            self, "your rank", "what's your global osu!taiko pp rank?\n"
-            "(used for your first skill estimate; your plays refine it afterwards)",
-            int(self.state.user.get("pp_rank", 10000)), 1, 10_000_000, 1)
-        if ok:
-            self.state.set_skill_from_rank(rank)
+        dlg = rank_dialog(self, int(self.state.user.get("pp_rank", 10000)))
+        if dlg.exec():
+            self.state.set_skill_from_rank(dlg.intValue())
             self.refresh_all()

@@ -4,12 +4,13 @@ values for the common mod combinations, and the skill quantile table.
     python build_base_package.py ^
         --checkpoint <dataset>\checkpoint_last.pt --dataset_dir <dataset> ^
         --congregal_db <congregals.sqlite> --plays_db <taiko_plays.sqlite> ^
-        --dump_dir <data.ppy.sh dump folder> ^
+        --dump_dir <data.ppy.sh dump folder> --osu_dir <data.ppy.sh osu_files folder> ^
         --version 2026.11.1 --out ..\dist\base
 
 Charts: every beatmap with playmode 1 and approved 1 or 2 (taiko_plays.sqlite's
 beatmaps.eligible) that has congregal values. Metadata comes from the dump's
-osu_beatmaps.sql / osu_beatmapsets.sql. Per-note slope/bias come from the
+osu_beatmaps.sql / osu_beatmapsets.sql; the length (first to last note, breaks
+included) is read from the chart's .osu file in --osu_dir. Per-note slope/bias come from the
 checkpoint's note subnet (PyTorch, GPU if available) for NM, HD, HR, DT, HDHR,
 HDDT, HT, EZ, stored quantized (--bits).
 
@@ -47,12 +48,12 @@ def load_metadata(dump_dir: Path, wanted: set[int]) -> dict[int, dict]:
 
     maps = {}
     for r in rows(dump_dir / "osu_beatmaps.sql", "osu_beatmaps",
-                  ["beatmap_id", "beatmapset_id", "version", "total_length", "hit_length", "diff_drain",
+                  ["beatmap_id", "beatmapset_id", "version", "diff_drain",
                    "diff_overall", "bpm", "approved", "checksum"]):
         bid = int(r["beatmap_id"])
         if bid in wanted:
             maps[bid] = dict(beatmap_id=bid, beatmapset_id=P.sql_int(r["beatmapset_id"]),
-                             version=P.sql_str(r["version"]), length_s=float(r["hit_length"]),
+                             version=P.sql_str(r["version"]),
                              hp=float(r["diff_drain"]), od=float(r["diff_overall"]), bpm=float(r["bpm"]),
                              status=int(r["approved"]), file_md5=P.sql_str(r["checksum"]))
     sets = {m["beatmapset_id"] for m in maps.values()}
@@ -66,6 +67,39 @@ def load_metadata(dump_dir: Path, wanted: set[int]) -> dict[int, dict]:
     for m in maps.values():
         m.update(set_info.get(m["beatmapset_id"], {}))
     return maps
+
+
+# --------------------------------------------------------------------------- lengths
+class OsuFiles:
+    """Finds a beatmap's .osu file: <osu_dir>/<beatmap_id>.osu (data.ppy.sh's osu_files
+    layout), else any file with that name below osu_dir."""
+
+    def __init__(self, osu_dir: Path | None):
+        self.dir = Path(osu_dir) if osu_dir else None
+        self._index: dict[str, Path] | None = None
+
+    def path(self, bid: int) -> Path | None:
+        if self.dir is None:
+            return None
+        p = self.dir / f"{bid}.osu"
+        if p.is_file():
+            return p
+        if self._index is None:
+            self._index = {f.name.lower(): f for f in self.dir.rglob("*.osu")}
+        return self._index.get(f"{bid}.osu")
+
+
+def note_span(path: Path) -> tuple[float, str] | None:
+    """(seconds from first to last note, file md5) with the app's own .osu parser."""
+    from taiko_core.importer import note_span_seconds
+    from taiko_core.osu.osu_reader import read_osu_file
+    from taiko_core.osu.taiko_bo import parse_taiko_chart
+
+    try:
+        chart = parse_taiko_chart(read_osu_file(path))
+    except Exception:                                                       # noqa: BLE001
+        return None
+    return note_span_seconds(chart.circle_times), chart.file_md5
 
 
 # --------------------------------------------------------------------------- skill per play
@@ -152,6 +186,8 @@ def build(args):
         bids = bids[:args.limit]
     metadata = load_metadata(Path(args.dump_dir), set(bids))
     log(f"metadata found for {len(metadata):,} beatmaps")
+    osu_files = OsuFiles(args.osu_dir)
+    n_len = n_len_missing = n_len_other_md5 = 0
 
     db = ChartDB(out / "charts.sqlite", create_meta={"kind": "base", "model_id": model_id, "version": args.version,
                                                      "bits": args.bits, "pipeline_version": C.PIPELINE_VERSION})
@@ -168,6 +204,15 @@ def build(args):
             variants = {m: (slope[j], bias[j]) for j, m in enumerate(BASE_MODS)}
             info = dict(metadata.get(bid, {"beatmap_id": bid}))
             info.setdefault("file_md5", md5)
+            p = osu_files.path(bid)
+            span = note_span(p) if p is not None else None
+            if span is None:
+                info["length_s"] = None
+                n_len_missing += 1
+            else:
+                info["length_s"] = span[0]
+                n_len += 1
+                n_len_other_md5 += span[1] != md5
             info["n_notes"] = int(slope.shape[1])
             cid = db.add_chart(info, variants, commit=False)
             if rng.random() < args.error_sample:
@@ -179,6 +224,11 @@ def build(args):
                 last = now
                 print(f"  charts: {i + 1:,}/{len(bids):,} ({now - t0:.0f}s)", flush=True)
     db.commit()
+    log(f"lengths (first to last note) from .osu files: {n_len:,}; without a readable .osu file: "
+        f"{n_len_missing:,} (shown blank)" + (f"; {n_len_other_md5:,} files differ from the version the "
+                                               "congregals were computed from" if n_len_other_md5 else ""))
+    if args.osu_dir is None:
+        log("WARNING: no --osu_dir given, so no chart has a length")
 
     # ---- skill quantiles -------------------------------------------------------------------
     table = ckpt["model"]["skill_subnet.table"].float().numpy()
@@ -220,6 +270,8 @@ def main(argv=None):
     ap.add_argument("--congregal_db", required=True)
     ap.add_argument("--plays_db", required=True, help="taiko_plays.sqlite")
     ap.add_argument("--dump_dir", required=True, help="folder with osu_beatmaps.sql and osu_beatmapsets.sql")
+    ap.add_argument("--osu_dir", default=None,
+                    help="data.ppy.sh osu_files folder (<beatmap_id>.osu), for the chart lengths")
     ap.add_argument("--version", required=True, help="package version, e.g. 2026.11.1")
     ap.add_argument("--out", default=str(C.HERE.parent / "dist" / "base"))
     ap.add_argument("--bits", type=int, choices=[8, 16], default=8, help="per-note value precision")

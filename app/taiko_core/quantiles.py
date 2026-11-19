@@ -85,6 +85,31 @@ class QuantileTable:
         out = np.where(qs < 0, self.values[:, 0] + qs * self.slope_low, out)
         return np.where(qs > 1, self.values[:, -1] + (qs - 1.0) * self.slope_high, out)
 
+    def normal_scale(self) -> tuple[np.ndarray, np.ndarray]:
+        """(median, sigma) per dimension, sigma = interquartile range / 1.349: the normal
+        distribution with the same median and quartiles (for normal-equivalent scores)."""
+        iqr_z = 2 * 0.6744897501960817                     # Phi^-1(0.75) - Phi^-1(0.25)
+        med = self.values_at(0.5)
+        sigma = (self.values_at(0.75) - self.values_at(0.25)) / iqr_z
+        return med, np.maximum(sigma, 1e-12)
+
+    def quantile_slopes(self, skill) -> np.ndarray:
+        """d quantile / d value in each dimension at `skill` (the mapping is piecewise
+        linear, so this is constant on each segment; tails use the tail slopes)."""
+        s = np.asarray(skill, np.float64)
+        out = np.empty(self.D)
+        step = 1.0 / (self.K - 1)
+        for k in range(self.D):
+            v = self.values[k]
+            if s[k] < v[0]:
+                out[k] = 1.0 / self.slope_low[k]
+            elif s[k] > v[-1]:
+                out[k] = 1.0 / self.slope_high[k]
+            else:
+                i = min(max(int(np.searchsorted(v, s[k], side="right")) - 1, 0), self.K - 2)
+                out[k] = step / max(v[i + 1] - v[i], 1e-9)
+        return out
+
     def quantiles_of(self, skill) -> np.ndarray:
         s = np.asarray(skill, np.float64)
         return np.array([self.quantile(k, s[k]) for k in range(self.D)])

@@ -114,6 +114,15 @@ class UserData:
         return dict(created_at=row[0], skill=np.array(json.loads(row[1])), quantiles=np.array(json.loads(row[2] or "[]")),
                     n_plays=row[3], method=row[4], model_id=row[5])
 
+    def previous_skill(self) -> dict | None:
+        """The estimate before the current one (None if there is only one)."""
+        row = self.conn.execute("SELECT created_at, skill, quantiles, n_plays, method, model_id "
+                                "FROM skill_estimates ORDER BY estimate_id DESC LIMIT 1 OFFSET 1").fetchone()
+        if row is None:
+            return None
+        return dict(created_at=row[0], skill=np.array(json.loads(row[1])), quantiles=np.array(json.loads(row[2] or "[]")),
+                    n_plays=row[3], method=row[4], model_id=row[5])
+
     def reset_skill(self):
         self.conn.execute("DELETE FROM skill_estimates")
         self.conn.commit()

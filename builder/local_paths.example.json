@@ -6,6 +6,7 @@
     "congregal_db": "<path to congregals.sqlite>",
     "plays_db": "<path to taiko_plays.sqlite>",
     "dump_dir": "<data.ppy.sh dump folder with osu_beatmaps.sql and osu_beatmapsets.sql>",
+    "osu_dir": "<data.ppy.sh osu_files folder with <beatmap_id>.osu files (for chart lengths)>",
     "code_dir": "<folder that contains taiko_app, difficulty_nn and taiko_pipeline>"
   },
   "private_strings": [

@@ -22,8 +22,11 @@ import hashlib
 import json
 import os
 import shutil
+import ssl
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -134,17 +137,44 @@ def install_zip(zip_path, kind: str, expected_model_id: str | None = None, progr
             raise PackageError(f"package lacks {missing}")
         if expected_model_id and manifest.get("model_id") != expected_model_id:
             raise PackageError("package model does not match the expected one")
-        old = dest.with_name(dest.name + ".old")
-        if old.exists():
-            shutil.rmtree(old, ignore_errors=True)
-        if dest.exists():
-            dest.rename(old)
-        tmp.rename(dest)
-        shutil.rmtree(old, ignore_errors=True)
+        replace_dir(tmp, dest, kind)
         return manifest
     finally:
         if tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+IN_USE_HELP = ("a file in it is in use. close any other copy of the app and programs that may be reading "
+               "that folder (an antivirus scan, a sync or backup tool), then try again")
+
+
+def _retry(action, what: str, attempts: int = 8, delay: float = 0.5):
+    """Windows refuses to rename a folder while a file in it is open; antivirus scanners and
+    sync tools hold files briefly, so retry for a few seconds before giving up."""
+    for i in range(attempts):
+        try:
+            return action()
+        except PermissionError as e:
+            if i == attempts - 1:
+                raise PackageError(f"couldn't {what}: {IN_USE_HELP}. ({e})") from e
+            time.sleep(delay)
+
+
+def replace_dir(new: Path, dest: Path, kind: str = "package", attempts: int = 8, delay: float = 0.5):
+    """Swap the freshly unpacked folder `new` into place at `dest`, keeping the old one if
+    anything fails. The caller must have closed every file it had open in `dest`."""
+    for stale in dest.parent.glob(dest.name + ".old*"):           # leftovers of earlier attempts
+        shutil.rmtree(stale, ignore_errors=True)
+    old = dest.with_name(f"{dest.name}.old-{int(time.time() * 1000)}")
+    if dest.exists():
+        _retry(lambda: dest.rename(old), f"replace the installed {kind} package", attempts, delay)
+    try:
+        _retry(lambda: new.rename(dest), f"install the new {kind} package", attempts, delay)
+    except BaseException:
+        if old.exists() and not dest.exists():
+            old.rename(dest)                                      # put the previous version back
+        raise
+    shutil.rmtree(old, ignore_errors=True)
 
 
 def uninstall(kind: str):
@@ -165,7 +195,27 @@ class _DropAuthOnRedirect(urllib.request.HTTPRedirectHandler):
         return new
 
 
-_opener = urllib.request.build_opener(_DropAuthOnRedirect)
+def ssl_context() -> ssl.SSLContext:
+    """Certificate checking for downloads. Python's own check on Windows only sees the root
+    certificates Windows has already cached, and Windows adds roots lazily, so a site whose
+    root it hasn't needed yet fails with 'unable to get issuer certificate'. truststore asks
+    Windows itself to verify (it fetches missing roots, and honours company/antivirus roots);
+    without it, the default store plus certifi's root list is used."""
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:                                                       # noqa: BLE001
+        pass
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:                                                       # noqa: BLE001
+        pass
+    return ctx
+
+
+_opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_context()), _DropAuthOnRedirect)
 
 
 def _token() -> str:
@@ -211,6 +261,13 @@ def _open_download(browser_url: str, timeout: float = 60):
     return _open(browser_url, timeout)
 
 
+def _hint(e: Exception) -> str:
+    if "CERTIFICATE_VERIFY_FAILED" in str(e) or isinstance(getattr(e, "reason", None), ssl.SSLError):
+        return (" (the secure connection couldn't be verified: run Install.bat again to update the app's "
+                "certificate support, and check the computer's date and time)")
+    return "" if _token() else " (if the repository is private, set OTR_GITHUB_TOKEN)"
+
+
 def fetch_versions(repo: str | None = None) -> dict:
     repo = repo or app_config().get("github_repo", "")
     if not repo or "/" not in repo or repo.startswith("OWNER"):
@@ -229,8 +286,7 @@ def fetch_versions(repo: str | None = None) -> dict:
     except PackageError:
         raise
     except Exception as e:                                                  # noqa: BLE001
-        hint = "" if _token() else " (if the repository is private, set OTR_GITHUB_TOKEN)"
-        raise PackageError(f"couldn't check for updates: {e}{hint}") from e
+        raise PackageError(f"couldn't check for updates: {e}{_hint(e)}") from e
 
 
 def download_package(entry: dict, kind: str, progress=None, cancelled=lambda: False) -> dict:
@@ -239,31 +295,11 @@ def download_package(entry: dict, kind: str, progress=None, cancelled=lambda: Fa
     work = data_dir() / "downloads"
     work.mkdir(parents=True, exist_ok=True)
     zip_path = work / f"{kind}.zip"
-    done = 0
-    h = hashlib.sha256()
     try:
-        with open(zip_path, "wb") as out:
-            for pi, part in enumerate(entry["parts"]):
-                ph = hashlib.sha256()
-                with _open_download(part["url"]) as r:
-                    while True:
-                        if cancelled():
-                            raise PackageError("download cancelled")
-                        chunk = r.read(1 << 20)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        ph.update(chunk)
-                        h.update(chunk)
-                        done += len(chunk)
-                        if progress:
-                            progress(0.9 * done / max(total, 1),
-                                     f"downloading part {pi + 1}/{len(entry['parts'])}: "
-                                     f"{done / 2**20:,.0f} / {total / 2**20:,.0f} MB")
-                if part.get("sha256") and ph.hexdigest() != part["sha256"]:
-                    raise PackageError(f"part {pi + 1} is damaged; try again")
-        if entry.get("sha256") and h.hexdigest() != entry["sha256"]:
-            raise PackageError("download is damaged (checksum mismatch); try again")
+        try:
+            _download_parts(entry, zip_path, total, progress, cancelled)
+        except (urllib.error.URLError, ssl.SSLError, TimeoutError, ConnectionError) as e:
+            raise PackageError(f"download failed: {getattr(e, 'reason', e)}{_hint(e)}") from e
         if progress:
             progress(0.9, "installing")
         return install_zip(zip_path, kind, entry.get("model_id"),
@@ -273,6 +309,33 @@ def download_package(entry: dict, kind: str, progress=None, cancelled=lambda: Fa
             zip_path.unlink()
         except OSError:
             pass
+
+
+def _download_parts(entry: dict, zip_path: Path, total: int, progress, cancelled):
+    done = 0
+    h = hashlib.sha256()
+    with open(zip_path, "wb") as out:
+        for pi, part in enumerate(entry["parts"]):
+            ph = hashlib.sha256()
+            with _open_download(part["url"]) as r:
+                while True:
+                    if cancelled():
+                        raise PackageError("download cancelled")
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    ph.update(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(0.9 * done / max(total, 1),
+                                 f"downloading part {pi + 1}/{len(entry['parts'])}: "
+                                 f"{done / 2**20:,.0f} / {total / 2**20:,.0f} MB")
+            if part.get("sha256") and ph.hexdigest() != part["sha256"]:
+                raise PackageError(f"part {pi + 1} is damaged; try again")
+    if entry.get("sha256") and h.hexdigest() != entry["sha256"]:
+        raise PackageError("download is damaged (checksum mismatch); try again")
 
 
 def open_url(url: str):

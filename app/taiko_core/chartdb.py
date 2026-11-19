@@ -162,6 +162,12 @@ class ChartDB:
         if commit:
             self.conn.commit()
 
+    def delete_variants(self, chart_id: int, mods_list, commit: bool = True):
+        self.conn.executemany("DELETE FROM variants WHERE chart_id = ? AND mods = ?",
+                              [(int(chart_id), int(m)) for m in mods_list])
+        if commit:
+            self.conn.commit()
+
     def delete_charts(self, chart_ids):
         ids = [(int(c),) for c in chart_ids]
         self.conn.executemany("DELETE FROM variants WHERE chart_id = ?", ids)

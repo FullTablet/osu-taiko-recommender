@@ -2,21 +2,23 @@
 from __future__ import annotations
 
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
-                               QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
-                               QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+                               QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTableWidgetSelectionRange,
+                               QVBoxLayout, QWidget)
 
 from taiko_core import packages
 from taiko_core.app_state import COMP_FILE, chart_label
 from taiko_core.chartdb import ChartDB, IncompatibleDatabase
-from taiko_core.importer import import_files, recompute_all
-from taiko_core.mods import DEFAULT_IMPORT_MODS, mods_label
+from taiko_core.importer import change_chart_mods, import_files, recompute_all
+from taiko_core.mods import DEFAULT_IMPORT_MODS, format_length, mods_label, played_length
 from taiko_core.recommend import DIMENSION_NAMES, DIMENSIONS
 
-from .widgets import (ChartPickerDialog, EditableCellDelegate, ModCheckRow, ModSelector, SkillPanel, copy_with_tip,
+from .widgets import (ChartModsDialog, ChartPickerDialog, ChartSearchDialog, EditableCellDelegate, EditPlayDialog, ModCheckRow, ModSelector, SkillPanel, copy_with_tip,
                       link_button, open_url, pct)
 from .worker import run_task
 
@@ -40,6 +42,24 @@ def _table(headers, stretch_col=0):
     return t
 
 
+@contextmanager
+def bulk_fill(table: QTableWidget):
+    """Fill a table quickly: with 'resize to contents' columns, Qt re-measures every row
+    after EACH cell that is set (seconds for a few hundred rows of a visible table).
+    Columns are fixed while filling and re-measured once at the end."""
+    hdr = table.horizontalHeader()
+    modes = [hdr.sectionResizeMode(c) for c in range(table.columnCount())]
+    table.setUpdatesEnabled(False)
+    for c in range(table.columnCount()):
+        hdr.setSectionResizeMode(c, QHeaderView.Interactive)
+    try:
+        yield table
+    finally:
+        for c, m in enumerate(modes):
+            hdr.setSectionResizeMode(c, m)
+        table.setUpdatesEnabled(True)
+
+
 def parse_percent(text: str):
     """'97.5', '97.5%', '97,5' -> 0.975; '' -> None; raises ValueError otherwise."""
     t = text.strip().replace("%", "").replace(",", ".")
@@ -52,6 +72,11 @@ def parse_percent(text: str):
 
 
 # =============================================================================== recommendations
+IMPORTED_LINK_NOTE = ("\n\nthis is one of your imported charts: the beatmap ID comes from its .osu file, "
+                      "which may not match the chart on the website (for example if the file was edited, is an "
+                      "older or unsubmitted version, or the ID was copied from another difficulty).")
+
+
 def beatmap_urls(info: dict) -> tuple[str, str] | None:
     """(website URL, osu!direct URL) for a chart with a beatmap ID, else None."""
     try:
@@ -64,15 +89,19 @@ def beatmap_urls(info: dict) -> tuple[str, str] | None:
 
 
 def search_text(info: dict) -> str:
-    """What the chart button copies for osu!'s song-select search: 'Artist Title Difficulty'."""
-    return " ".join(str(info.get(k) or "").strip() for k in ("artist", "title", "version") if info.get(k))
+    """What the chart button copies for osu!'s song-select search: 'Artist Title Difficulty',
+    without square brackets (osu!'s search reads [words] as a difficulty-name filter)."""
+    text = " ".join(str(info.get(k) or "").strip() for k in ("artist", "title", "version") if info.get(k))
+    return " ".join(text.replace("[", " ").replace("]", " ").split())
 
 
 class RecommendTab(QWidget):
-    COLUMNS = ["URL", "osu!direct", "chart", "mapper", "mods", "expected accuracy"] + DIMENSIONS + ["your accuracy (%)"]
-    COL_URL, COL_DIRECT, COL_CHART, COL_MAPPER, COL_MODS, COL_EXPECTED = range(6)
-    COL_PRIORITY = 6
-    COL_ACC = 6 + len(DIMENSIONS)
+    COLUMNS = (["URL", "osu!direct", "chart", "mapper", "length", "mods", "expected accuracy"] + DIMENSIONS
+               + ["details", "your accuracy (%)"])
+    COL_URL, COL_DIRECT, COL_CHART, COL_MAPPER, COL_LENGTH, COL_MODS, COL_EXPECTED = range(7)
+    COL_PRIORITY = 7
+    COL_DETAILS = 7 + len(DIMENSIONS)
+    COL_ACC = COL_DETAILS + 1
     PRIORITY_ITEMS = [("none", None)] + [(f"{g}  {n}", i) for i, (g, n) in enumerate(zip(DIMENSIONS, DIMENSION_NAMES))]
 
     def __init__(self, main):
@@ -122,9 +151,12 @@ class RecommendTab(QWidget):
 
         row = QHBoxLayout()
         self.get_btn = QPushButton("get recommendations")
+        self.add_btn = QPushButton("add a chart…")
+        self.add_btn.setToolTip("search a chart and add it at the bottom of the list (with the mods selected above)")
         self.submit_btn = QPushButton("submit plays and update skill")
         self.submit_btn.setEnabled(False)
         row.addWidget(self.get_btn)
+        row.addWidget(self.add_btn)
         self.result_info = QLabel("")
         self.result_info.setStyleSheet("color: gray")
         row.addWidget(self.result_info)
@@ -145,8 +177,9 @@ class RecommendTab(QWidget):
         lay.addWidget(self.table)
 
         self.load_settings()
-        self.get_btn.clicked.connect(self.get_recommendations)
-        self.submit_btn.clicked.connect(self.submit)
+        self.get_btn.clicked.connect(lambda _c=False: self.get_recommendations())
+        self.add_btn.clicked.connect(self.add_chart)
+        self.submit_btn.clicked.connect(lambda _c=False: self.submit())
         for w in (self.k_spin, self.s_spin):
             w.valueChanged.connect(lambda _v: self.save_settings())
         self.target.valueChanged.connect(lambda _v: self.save_settings())
@@ -188,11 +221,42 @@ class RecommendTab(QWidget):
         self.skill.refresh()
         ok = self.state.has_base and self.state.current_skill() is not None
         self.get_btn.setEnabled(ok)
+        self.add_btn.setEnabled(ok)
         if self.state.has_base:
             self.update_mods_info()
 
     # ---- actions
-    def get_recommendations(self):
+    def typed_rows(self) -> int:
+        """Rows whose 'your accuracy' cell has something typed in it."""
+        return sum(1 for i in range(len(self.recs))
+                   if self.table.item(i, self.COL_ACC) and self.table.item(i, self.COL_ACC).text().strip())
+
+    def ask_unsubmitted(self, n: int) -> str:
+        """'submit', 'discard' or 'cancel'."""
+        box = QMessageBox(self)
+        box.setWindowTitle("unsubmitted plays")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(f"you typed the accuracy of {n} chart{'s' if n != 1 else ''} but haven't submitted "
+                    f"{'them' if n != 1 else 'it'}. new recommendations replace the list.")
+        submit = box.addButton("submit them and get recommendations", QMessageBox.AcceptRole)
+        discard = box.addButton("discard them and get recommendations", QMessageBox.DestructiveRole)
+        cancel = box.addButton("cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(submit)
+        box.setEscapeButton(cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        return "submit" if clicked is submit else "discard" if clicked is discard else "cancel"
+
+    def get_recommendations(self, confirm: bool = True):
+        if confirm:
+            n = self.typed_rows()
+            if n:
+                choice = self.ask_unsubmitted(n)
+                if choice == "cancel":
+                    return
+                if choice == "submit":
+                    self.submit(searching=True)      # new recommendations follow the skill update;
+                    return                           # nothing at all if an accuracy is invalid
         settings = self.current_settings()
         if self.state.count_variants(settings["mods"]) == 0:
             QMessageBox.information(self, "no charts", f"there are no charts with {mods_label(settings['mods'])} "
@@ -202,10 +266,11 @@ class RecommendTab(QWidget):
 
         def done(res):
             self.recs = res["charts"]
-            self.table.clearContents()
-            self.table.setRowCount(len(self.recs))
-            for i, r in enumerate(self.recs):
-                self.fill_row(i, r)
+            with bulk_fill(self.table):
+                self.table.clearContents()
+                self.table.setRowCount(len(self.recs))
+                for i, r in enumerate(self.recs):
+                    self.fill_row(i, r)
             self.result_info.setText(f"{res['in_window']} of {res['candidates']:,} charts searched are within "
                                      f"target ± 1%")
             self.submit_btn.setEnabled(bool(self.recs))
@@ -221,15 +286,22 @@ class RecommendTab(QWidget):
             t.setItem(i, col, _item(""))
         if urls:
             web, direct = urls
-            t.setCellWidget(i, self.COL_URL, link_button(web, "open the chart's page in your browser (download it there)",
-                                                         lambda _c=False, u=web: open_url(u)))
-            t.setCellWidget(i, self.COL_DIRECT, link_button(direct, "open the chart in the osu! client (osu!direct)",
-                                                            lambda _c=False, u=direct: open_url(u)))
+            imported = r["ref"].source != "base"
+            note = IMPORTED_LINK_NOTE if imported else ""
+            t.setCellWidget(i, self.COL_URL, link_button(
+                web, "open the chart's page in your browser (download it there)" + note,
+                lambda _c=False, u=web: open_url(u), muted=imported))
+            t.setCellWidget(i, self.COL_DIRECT, link_button(
+                direct, "open the chart in the osu! client (osu!direct)" + note,
+                lambda _c=False, u=direct: open_url(u), muted=imported))
         t.setItem(i, self.COL_CHART, _item(""))
         btn = link_button(r["label"], "click to copy 'artist title difficulty' for osu!'s search box", None, align_left=True)
         btn.clicked.connect(lambda _c=False, b=btn, text=search_text(info) or r["label"]: copy_with_tip(b, text))
         t.setCellWidget(i, self.COL_CHART, btn)
         t.setItem(i, self.COL_MAPPER, _item(info.get("creator") or ""))
+        length = _item(format_length(played_length(info.get("length_s"), r["mods"])), align=Qt.AlignCenter)
+        length.setToolTip("first to last note (breaks included), at the speed of the selected mods")
+        t.setItem(i, self.COL_LENGTH, length)
         t.setItem(i, self.COL_MODS, _item(r["mods_label"], align=Qt.AlignCenter))
         exp = _item(pct(r["expected"], 2), align=Qt.AlignCenter)
         if not r["in_window"]:
@@ -238,24 +310,100 @@ class RecommendTab(QWidget):
         t.setItem(i, self.COL_EXPECTED, exp)
         for k, p in enumerate(r["priorities"]):
             t.setItem(i, self.COL_PRIORITY + k, _item(pct(p, 1), align=Qt.AlignCenter))
+        t.setItem(i, self.COL_DETAILS, _item(""))
+        t.setCellWidget(i, self.COL_DETAILS, link_button("click here!", "per-note graph and all mod combinations",
+                                                         lambda _c=False, row=r: self.show_details(row)))
         t.setItem(i, self.COL_ACC, _item("", editable=True, align=Qt.AlignCenter))
 
-    def submit(self):
-        rows = []
-        try:
-            for i, r in enumerate(self.recs):
-                it = self.table.item(i, self.COL_ACC)
-                acc = parse_percent(it.text() if it else "")
-                if acc is not None:
-                    rows.append((r["ref"], r["mods"], acc))
-        except ValueError as e:
-            QMessageBox.warning(self, "accuracy", f"row {i + 1}: {e}")
+    def add_chart(self):
+        settings = self.current_settings()
+        dlg = ChartSearchDialog(self.state, settings["mods"], self)
+        if not dlg.exec() or dlg.selected_ref() is None:
             return
+        self.append_chart(dlg.selected_ref(), settings["mods"])
+
+    def append_chart(self, ref, mods: int) -> bool:
+        """Add a chart with these mods at the bottom of the list (target and priority from
+        the settings). False if the chart doesn't have that mod combination."""
+        settings = dict(self.current_settings(), mods=mods)
+        r = self.state.recommendation_row(ref, settings)
+        if r is None:
+            return False
+        self.recs.append(r)
+        i = self.table.rowCount()
+        with bulk_fill(self.table):
+            self.table.setRowCount(i + 1)
+            self.fill_row(i, r)
+        self.table.scrollToBottom()
+        self.submit_btn.setEnabled(True)
+        return True
+
+    def show_details(self, r: dict):
+        target = self.current_settings()["target"]
+        if not hasattr(self, "_detail_windows"):
+            self._detail_windows = []
+
+        def done(details):
+            from .details import ChartDetailsDialog
+
+            dlg = ChartDetailsDialog(details, self, on_add=lambda m, ref=r["ref"]: self.append_chart(ref, m))
+            dlg.setAttribute(Qt.WA_DeleteOnClose)          # closing frees it; forget it then
+            self._detail_windows.append(dlg)
+            dlg.destroyed.connect(lambda _o=None, d=dlg: self._forget_window(d))
+            dlg.show()
+
+        run_task(self, "computing chart details",
+                 lambda p, c: self.state.chart_details(r["ref"], r["mods"], target, progress=p), done)
+
+    def _forget_window(self, dlg):
+        self._detail_windows = [w for w in self._detail_windows if w is not dlg]
+
+    def invalid_rows(self) -> list[int]:
+        bad = []
+        for i in range(len(self.recs)):
+            it = self.table.item(i, self.COL_ACC)
+            try:
+                parse_percent(it.text() if it else "")
+            except ValueError:
+                bad.append(i)
+        return bad
+
+    def warn_invalid(self, bad: list[int], searching: bool):
+        """Select the rows with an invalid accuracy and say so; nothing is submitted."""
+        self.table.clearSelection()
+        for i in bad:
+            self.table.setRangeSelected(QTableWidgetSelectionRange(i, 0, i, self.table.columnCount() - 1), True)
+        self.table.scrollToItem(self.table.item(bad[0], self.COL_ACC))
+        listing = "\n".join(f"  row {i + 1}: {self.recs[i]['label']}  ('{self.table.item(i, self.COL_ACC).text()}')"
+                             for i in bad[:10]) + ("\n  ..." if len(bad) > 10 else "")
+        QMessageBox.warning(
+            self, "invalid accuracies",
+            f"some of the accuracies you typed aren't valid (use a number from 0 to 100, like 97.25):\n\n{listing}"
+            f"\n\nplease check them (they're selected in the list). nothing was submitted"
+            + (" and no new recommendations were searched." if searching else "."))
+
+    def submit(self, searching: bool = False) -> bool:
+        """Record the typed accuracies and update the skill (then new recommendations).
+        Returns False, without recording anything, if a typed accuracy is invalid."""
+        bad = self.invalid_rows()
+        if bad:
+            self.warn_invalid(bad, searching)
+            return False
+        rows = []
+        for i, r in enumerate(self.recs):
+            it = self.table.item(i, self.COL_ACC)
+            acc = parse_percent(it.text() if it else "")
+            if acc is not None:
+                rows.append((r["ref"], r["mods"], acc))
         if not rows:
             QMessageBox.information(self, "no plays", "type the accuracy of at least one chart first.")
-            return
+            return False
         self.state.record_plays(rows)
         self.submit_btn.setEnabled(False)
+        for i in range(len(self.recs)):              # recorded: nothing is left unsubmitted
+            it = self.table.item(i, self.COL_ACC)
+            if it is not None:
+                it.setText("")
 
         def done(info):
             self.main.refresh_all()
@@ -263,10 +411,11 @@ class RecommendTab(QWidget):
                 QMessageBox.information(self, "skill updated",
                                         f"{info['missing']} of your plays are on charts that aren't available "
                                         "(removed or not yet re-imported) and were left out.")
-            self.get_recommendations()
+            self.get_recommendations(confirm=False)
 
         run_task(self, "updating your skill", lambda p, c: self.state.update_skill(progress=p), done,
                  cancellable=False)
+        return True
 
 
 # =============================================================================== my plays
@@ -278,7 +427,8 @@ class PlaysTab(QWidget):
         lay = QVBoxLayout(self)
         row = QHBoxLayout()
         self.add_btn = QPushButton("add play…")
-        self.edit_btn = QPushButton("change accuracy…")
+        self.edit_btn = QPushButton("edit play…")
+        self.edit_btn.setToolTip("change the mods or the accuracy of the selected play (or double-click it)")
         self.del_btn = QPushButton("delete selected")
         self.recalc_btn = QPushButton("recalculate skill")
         self.rank_btn = QPushButton("restart from pp rank…")
@@ -291,7 +441,7 @@ class PlaysTab(QWidget):
         self.info = QLabel("")
         self.info.setStyleSheet("color: gray")
         lay.addWidget(self.info)
-        self.table = _table(["#", "chart", "mods", "accuracy", "entered"], stretch_col=1)
+        self.table = _table(["#", "chart", "mapper", "mods", "accuracy", "entered"], stretch_col=1)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         lay.addWidget(self.table)
         self.add_btn.clicked.connect(self.add_play)
@@ -303,24 +453,39 @@ class PlaysTab(QWidget):
 
     def refresh(self):
         plays = self.state.user.plays(newest_first=True)
-        self.table.setRowCount(len(plays))
         n = len(plays)
-        for i, p in enumerate(plays):
-            self.table.setItem(i, 0, _item(n - i, align=Qt.AlignCenter))
-            label = p["label"] or (f"#{p['beatmap_id']}" if p["source"] == "base" else p["file_md5"])
-            if p["source"] == "comp":
-                label += "  (imported)"
-            it = _item(label)
-            it.setData(Qt.UserRole, p["play_id"])
-            self.table.setItem(i, 1, it)
-            self.table.setItem(i, 2, _item(mods_label(p["mods"]), align=Qt.AlignCenter))
-            self.table.setItem(i, 3, _item(pct(p["accuracy"], 2), align=Qt.AlignCenter))
-            self.table.setItem(i, 4, _item(p["played_at"] or ""))
+        mappers = {}                                  # one lookup per chart, not per play
+        with bulk_fill(self.table):
+            self.table.setRowCount(n)
+            for i, p in enumerate(plays):
+                self.table.setItem(i, 0, _item(n - i, align=Qt.AlignCenter))
+                label = p["label"] or (f"#{p['beatmap_id']}" if p["source"] == "base" else p["file_md5"])
+                if p["source"] == "comp":
+                    label += "  (imported)"
+                it = _item(label)
+                it.setData(Qt.UserRole, p["play_id"])
+                self.table.setItem(i, 1, it)
+                key = (p["source"], p["beatmap_id"], p["file_md5"])
+                if key not in mappers:
+                    mappers[key] = self._mapper(p)
+                self.table.setItem(i, 2, _item(mappers[key]))
+                self.table.setItem(i, 3, _item(mods_label(p["mods"]), align=Qt.AlignCenter))
+                self.table.setItem(i, 4, _item(pct(p["accuracy"], 2), align=Qt.AlignCenter))
+                self.table.setItem(i, 5, _item(p["played_at"] or ""))
         ok = self.state.has_base
         for b in (self.add_btn, self.recalc_btn, self.rank_btn):
             b.setEnabled(ok)
-        self.info.setText(f"{n} plays (newest first). only the most recent 1,000 are used, "
-                          "each weighted 0.99× the one after it.")
+        self.info.setText(f"{n} plays (newest first). your skill comes from the most recent 1,000; each note "
+                          "counts 0.99× as much as the note 650 notes after it (the last note of your newest play "
+                          "counts most), so older plays fade gradually.")
+
+    def _mapper(self, play: dict) -> str:
+        try:
+            ref = self.state.resolve_play(play)
+        except Exception:                                                   # noqa: BLE001
+            ref = None
+        info = self.state.chart_info(ref) if ref is not None else None
+        return (info or {}).get("creator") or ""
 
     def _selected_ids(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
@@ -338,11 +503,13 @@ class PlaysTab(QWidget):
         if len(ids) != 1:
             return
         play = next(p for p in self.state.user.plays() if p["play_id"] == ids[0])
-        val, ok = QInputDialog.getDouble(self, "change accuracy", f"{play['label']}\naccuracy (%)",
-                                         play["accuracy"] * 100, 0.0, 100.0, 2)
-        if ok:
-            self.state.user.update_play(ids[0], accuracy=val / 100.0)
+        dlg = EditPlayDialog(self.state, play, self)
+        if self.exec_dialog(dlg):
+            self.state.user.update_play(ids[0], accuracy=dlg.result_accuracy, mods=dlg.result_mods)
             self.refresh()
+
+    def exec_dialog(self, dlg) -> bool:            # (tests replace this)
+        return bool(dlg.exec())
 
     def delete_plays(self):
         ids = self._selected_ids()
@@ -395,7 +562,7 @@ class ChartsTab(QWidget):
         srow.addWidget(QLabel("search"))
         srow.addWidget(self.filter)
         lay.addLayout(srow)
-        self.table = _table(["chart", "notes", "mods", "file hash", "added"])
+        self.table = _table(["chart", "mapper", "notes", "mods", "file hash", "added"])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         lay.addWidget(self.table)
         self.import_btn.clicked.connect(self.import_charts)
@@ -404,6 +571,8 @@ class ChartsTab(QWidget):
         self.export_btn.clicked.connect(self.export_db)
         self.merge_btn.clicked.connect(self.merge_db)
         self.filter.textChanged.connect(lambda _t: self.refresh_table())
+        self.table.doubleClicked.connect(lambda index: self.edit_mods(index.row()))
+        self.table.setToolTip("double-click a chart to add or remove its mod combinations")
         for cb in self.mods.boxes.values():
             cb.toggled.connect(lambda _c: self.state.user.set("import_mods", self.mods.selected()))
 
@@ -428,15 +597,17 @@ class ChartsTab(QWidget):
     def refresh_table(self):
         db = self.state.comp
         rows = db.search(self.filter.text(), limit=5000) if db else []
-        self.table.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            it = _item(chart_label(r))
-            it.setData(Qt.UserRole, r["chart_id"])
-            self.table.setItem(i, 0, it)
-            self.table.setItem(i, 1, _item(r["n_notes"], align=Qt.AlignCenter))
-            self.table.setItem(i, 2, _item(len(db.mods_of(r["chart_id"])), align=Qt.AlignCenter))
-            self.table.setItem(i, 3, _item(r["file_md5"]))
-            self.table.setItem(i, 4, _item(r["added_at"] or ""))
+        with bulk_fill(self.table):
+            self.table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                it = _item(chart_label(r))
+                it.setData(Qt.UserRole, r["chart_id"])
+                self.table.setItem(i, 0, it)
+                self.table.setItem(i, 1, _item(r.get("creator") or ""))
+                self.table.setItem(i, 2, _item(r["n_notes"], align=Qt.AlignCenter))
+                self.table.setItem(i, 3, _item(len(db.mods_of(r["chart_id"])), align=Qt.AlignCenter))
+                self.table.setItem(i, 4, _item(r["file_md5"]))
+                self.table.setItem(i, 5, _item(r["added_at"] or ""))
 
     def import_charts(self):
         files, _ = QFileDialog.getOpenFileNames(self, "import charts", "", "osu! charts (*.osu *.osz)")
@@ -463,6 +634,30 @@ class ChartsTab(QWidget):
     def _selected_ids(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
         return [self.table.item(r, 0).data(Qt.UserRole) for r in rows]
+
+    def exec_dialog(self, dlg) -> bool:            # (tests replace this)
+        return bool(dlg.exec())
+
+    def edit_mods(self, row: int):
+        item = self.table.item(row, 0)
+        db = self.state.comp
+        if item is None or db is None:
+            return
+        cid = item.data(Qt.UserRole)
+        info = db.chart(cid) or {}
+        can_compute = self.state.has_expansion and self.state.comp_valid
+        dlg = ChartModsDialog(chart_label(info), db.mods_of(cid), can_compute, self)
+        if not self.exec_dialog(dlg):
+            return
+        add, remove = dlg.to_add(), dlg.to_remove()
+        model = self.state.model() if add else None
+
+        def done(res):
+            self.main.refresh_all()
+
+        run_task(self, "updating the chart's mod combinations",
+                 lambda p, c: change_chart_mods(db, model, cid, add, remove, progress=p), done,
+                 cancellable=False)
 
     def delete_charts(self):
         ids = self._selected_ids()
@@ -613,13 +808,11 @@ class UpdatesTab(QWidget):
                                     "database (different model). download it anyway?") != QMessageBox.Yes:
                 return
 
-        def done(_m):
-            self.state.reload()
-            self.main.refresh_all()
-            self.main.after_package_change()
-
-        run_task(self, f"downloading the {'base database' if kind == 'base' else 'expansion pack'}",
-                 lambda p, c: packages.download_package(ent, kind, progress=p, cancelled=c), done)
+        what = "base database" if kind == "base" else "expansion pack"
+        self.state.release_packages()                # the installed files must be closed to replace them
+        run_task(self, f"downloading the {what}",
+                 lambda p, c: packages.download_package(ent, kind, progress=p, cancelled=c),
+                 self._package_done, lambda msg: self._package_failed(f"downloading the {what}", msg))
 
     def install_file(self, kind):
         path, _ = QFileDialog.getOpenFileName(self, "install package", "", "package (*.zip)")
@@ -628,13 +821,19 @@ class UpdatesTab(QWidget):
         if kind == "base" and not self._confirm_base(None):
             return
 
-        def done(_m):
-            self.state.reload()
-            self.main.refresh_all()
-            self.main.after_package_change()
+        self.state.release_packages()
+        run_task(self, "installing", lambda p, c: packages.install_zip(path, kind, progress=lambda f: p(f, "")),
+                 self._package_done, lambda msg: self._package_failed("installing", msg), cancellable=False)
 
-        run_task(self, "installing", lambda p, c: packages.install_zip(path, kind, progress=lambda f: p(f, "")), done,
-                 cancellable=False)
+    def _package_done(self, _manifest):
+        self.state.reload()
+        self.main.refresh_all()
+        self.main.after_package_change()
+
+    def _package_failed(self, title, msg):
+        self.state.reload()                           # the previous version is still installed
+        self.main.refresh_all()
+        QMessageBox.warning(self, title, msg)
 
 
 __all__ = ["RecommendTab", "PlaysTab", "ChartsTab", "UpdatesTab", "COMP_FILE", "ChartDB", "IncompatibleDatabase"]

@@ -50,6 +50,12 @@ def chart_label(info: dict) -> str:
     return f"{info.get('artist') or '?'} - {info.get('title') or '?'} [{info.get('version') or '?'}]"
 
 
+def details_header(info: dict, mods: int) -> str:
+    """'Artist - Title [Diff] mapped by Mapper + HDDT' (no '+ ...' for NM)."""
+    mapper = f" mapped by {info['creator']}" if info.get("creator") else ""
+    return f"{chart_label(info)}{mapper}" + (f" + {mods_label(mods)}" if mods else "")
+
+
 class AppState:
     def __init__(self):
         self.user = UserData(packages.user_dir())
@@ -84,6 +90,15 @@ class AppState:
                 self.comp = ChartDB(comp_path)
             except IncompatibleDatabase:
                 self.comp = None
+
+    def release_packages(self):
+        """Close every file the app holds open inside the package folders, so a new
+        package can replace them (Windows can't rename a folder with open files).
+        Call reload() afterwards, whether the update worked or not."""
+        if self.base is not None:
+            self.base.close()
+        self.base = self.quantiles = None
+        self._model = None
 
     @property
     def has_base(self) -> bool:
@@ -156,6 +171,12 @@ class AppState:
         if cur is None or not self.has_base:
             return cur
         cur["quantiles"] = self.quantiles.quantiles_of(cur["skill"])        # always w.r.t. the installed table
+        # change since the previous estimate (both measured with the installed table; only if
+        # both raw skills come from the same model, otherwise they aren't comparable)
+        prev = self.user.previous_skill()
+        cur["change"] = None
+        if prev is not None and (prev.get("model_id") or "") == (cur.get("model_id") or ""):
+            cur["change"] = cur["quantiles"] - self.quantiles.quantiles_of(prev["skill"])
         return cur
 
     def set_skill_from_rank(self, rank: int) -> np.ndarray:
@@ -187,7 +208,7 @@ class AppState:
         data, missing = self.play_data(progress=progress)
         if progress:
             progress(0.85, "estimating skill")
-        skill, info = estimate_skill(data, prior_mean=cur["skill"],
+        skill, info = estimate_skill(data, prior_mean=cur["skill"], quantile_table=self.quantiles,
                                      progress=(lambda f: progress(0.85 + 0.15 * f, "estimating skill")) if progress else None)
         q = self.quantiles.quantiles_of(skill)
         self.user.save_skill(skill, q, len(data), "plays", self.model_id)
@@ -273,15 +294,54 @@ class AppState:
         chosen = scored[:st["S"]]
         out = []
         for j, (fit, ref, cm, ev) in enumerate(chosen):
-            pri = R.all_priorities(cm, target, ev["priorities"], ev["x_c"])
-            info = self.chart_info(ref)
-            out.append(dict(ref=ref, mods=mods, expected=ev["ha"], hapower=ev["hapower"], fiterror=fit,
-                            in_window=ev["in_window"], priorities=pri, info=info, label=chart_label(info),
-                            mods_label=mods_label(mods)))
+            out.append(self._rec_row(ref, mods, target, cm, ev))
             if progress:
                 progress(0.9 + 0.1 * (j + 1) / max(len(chosen), 1), "computing skill priorities")
         return dict(charts=out, candidates=len(scored), in_window=sum(1 for s in scored if s[3]["in_window"]),
                     settings=st, available=self.count_variants(mods))
+
+    def chart_details(self, ref: ChartRef, mods: int, target: float, progress=None) -> dict:
+        """Everything the chart details window shows: the header, the per-note expected
+        accuracy (current skill, these mods) and, for every mod combination the chart has
+        in the database, the expected accuracy and the priority of each skill at `target`."""
+        from .skill import note_probabilities
+
+        info = self.chart_info(ref) or {}
+        skill = self.current_skill()["skill"]
+        v = self.variant(ref, mods)
+        per_note = note_probabilities(v[0], v[1], skill) if v is not None else np.zeros(0)
+        rows = []
+        all_mods = list(self.db(ref.source).mods_of(ref.chart_id))
+        for i, m in enumerate(all_mods):
+            vm = self.variant(ref, m)
+            if vm is None or not len(vm[0]):
+                continue
+            cm = R.ChartModel(vm[0], vm[1], self.quantiles)
+            rows.append(dict(mods=m, mods_label=mods_label(m), expected=cm.accuracy_at_skill(skill),
+                             priorities=R.all_priorities(cm, target), per_note=note_probabilities(vm[0], vm[1], skill),
+                             header=details_header(info, m)))
+            if progress:
+                progress((i + 1) / len(all_mods), f"{mods_label(m)} ({i + 1}/{len(all_mods)})")
+        return dict(ref=ref, mods=mods, info=info, target=target, per_note=per_note, rows=rows,
+                    header=details_header(info, mods))
+
+    def _rec_row(self, ref: ChartRef, mods: int, target: float, cm, ev) -> dict:
+        pri = R.all_priorities(cm, target, ev["priorities"], ev["x_c"])
+        info = self.chart_info(ref)
+        return dict(ref=ref, mods=mods, expected=ev["ha"], hapower=ev["hapower"], fiterror=ev["fiterror"],
+                    in_window=ev["in_window"], priorities=pri, info=info, label=chart_label(info),
+                    mods_label=mods_label(mods))
+
+    def recommendation_row(self, ref: ChartRef, settings: dict | None = None) -> dict | None:
+        """A row like recommend()'s for a chart the player picked by hand (with the mods and
+        target of the settings); None if the chart lacks that mod combination."""
+        st = validate_rec_settings(settings or self.recommendation_settings())
+        v = self.variant(ref, st["mods"])
+        if v is None or not len(v[0]):
+            return None
+        cm = R.ChartModel(v[0], v[1], self.quantiles)
+        ev = R.evaluate(cm, self.current_skill()["skill"], st["target"], st["priority"])
+        return self._rec_row(ref, st["mods"], st["target"], cm, ev)
 
     def record_plays(self, rows: list[tuple[ChartRef, int, float]]):
         """rows in play order (the last becomes the most recent); accuracy 0..1."""

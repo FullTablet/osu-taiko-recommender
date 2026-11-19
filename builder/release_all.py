@@ -49,6 +49,7 @@ CHECKPOINT = Path(_P["checkpoint"]) if "checkpoint" in _P else None
 CONGREGAL_DB = Path(_P["congregal_db"]) if "congregal_db" in _P else None
 PLAYS_DB = Path(_P["plays_db"]) if "plays_db" in _P else None
 DUMP_DIR = Path(_P["dump_dir"]) if "dump_dir" in _P else None
+OSU_DIR = Path(_P["osu_dir"]) if _P.get("osu_dir") else None          # .osu files, for chart lengths
 DIST = C.HERE.parent / "dist"
 REPO = "FullTablet/osu-taiko-recommender"
 STEPS = ["check", "snapshot", "base", "expansion", "release"]
@@ -77,6 +78,9 @@ def step_check(args):
                            DUMP_DIR / "osu_beatmaps.sql", DUMP_DIR / "osu_beatmapsets.sql") if not p.exists()]
     if missing:
         raise SystemExit("missing input files:\n  " + "\n  ".join(map(str, missing)))
+    if OSU_DIR is None or not OSU_DIR.is_dir():
+        print(f"WARNING: no osu_dir in {_LOCAL.name} (or the folder doesn't exist): the charts will have no "
+              "length. set it to the data.ppy.sh osu_files folder")
     meta = C.load_dataset_meta(DATASET_DIR)              # refuses the old dataset format
     print(f"dataset: {meta['num_charts']:,} charts, {meta['total_plays']:,} plays, roster {meta['num_players']:,}")
     try:
@@ -151,8 +155,9 @@ def main(argv=None):
         elif step == "base":
             banner(i, len(steps), "building the base package (charts + skill quantiles)")
             extra = ["--limit", args.limit] if args.limit else []
+            osu = ["--osu_dir", OSU_DIR] if OSU_DIR is not None else []
             run("build_base_package.py", "--checkpoint", snap, "--dataset_dir", DATASET_DIR,
-                "--congregal_db", CONGREGAL_DB, "--plays_db", PLAYS_DB, "--dump_dir", DUMP_DIR,
+                "--congregal_db", CONGREGAL_DB, "--plays_db", PLAYS_DB, "--dump_dir", DUMP_DIR, *osu,
                 "--version", args.data_version, "--out", DIST / "base", "--overwrite", *extra)
         elif step == "expansion":
             banner(i, len(steps), "building the expansion pack (note subnet for NumPy)")
